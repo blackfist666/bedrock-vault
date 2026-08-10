@@ -221,7 +221,12 @@ pub struct Slot {
     pub rules: Vec<(String, String)>,
     /// True when this is the slot the Realm is currently running.
     pub active: bool,
+    /// No world has ever been put here.
+    pub empty: bool,
 }
+
+/// Every Bedrock Realm has three world slots, whether or not they hold a world.
+pub const SLOT_COUNT: i64 = 3;
 
 /// A Realm with everything the detail endpoint knows about it.
 #[derive(Debug, Clone, Serialize)]
@@ -249,10 +254,32 @@ pub fn detail(session: &auth::XstsToken, realm_id: i64) -> Result<RealmDetail> {
     let realm = realm_from_as(&body, session.xuid.as_deref());
     let active_slot = realm.active_slot;
 
-    let slots = body["slots"]
+    // The service reports only slots that have been used, but a Realm always
+    // has three; the unused ones are shown as empty rather than hidden.
+    let reported: Vec<Slot> = body["slots"]
         .as_array()
         .map(|list| list.iter().map(|s| slot_from(s, active_slot)).collect())
         .unwrap_or_default();
+    let slots: Vec<Slot> = (1..=SLOT_COUNT)
+        .map(|id| {
+            reported
+                .iter()
+                .find(|s| s.slot_id == id)
+                .cloned()
+                .unwrap_or_else(|| Slot {
+                    slot_id: id,
+                    name: None,
+                    game_mode: None,
+                    difficulty: None,
+                    hardcore: false,
+                    seed: None,
+                    pack_ids: Vec::new(),
+                    rules: Vec::new(),
+                    active: Some(id) == active_slot,
+                    empty: true,
+                })
+        })
+        .collect();
 
     let players = body["players"]
         .as_array()
@@ -347,8 +374,14 @@ fn slot_from(v: &serde_json::Value, active_slot: Option<i64>) -> Slot {
         pack_ids,
         rules: dedupe_rules(rules),
         active: Some(slot_id) == active_slot,
+        empty: false,
         slot_id,
     }
+}
+
+/// Make a slot the one the Realm runs.
+pub fn switch_to_slot(session: &auth::XstsToken, realm_id: i64, slot: i64) -> Result<()> {
+    request(session, "PUT", &format!("/worlds/{realm_id}/slot/{slot}")).map(|_| ())
 }
 
 /// Two spellings of the same rule arrive from different parts of the payload.
@@ -660,6 +693,11 @@ pub struct Replacement<'a> {
     /// Close the Realm before uploading. Realms requires it; only testing has
     /// reason to skip it.
     pub close_first: bool,
+    /// Download the slot's current world into the vault first.
+    ///
+    /// Only ever false for a slot that holds no world, where there is nothing
+    /// to lose. Never skip it for a slot in use.
+    pub backup_first: bool,
 }
 
 pub fn replace_slot_world(
@@ -668,20 +706,27 @@ pub fn replace_slot_world(
     job: &Replacement<'_>,
     mut on_step: impl FnMut(&str),
     on_progress: impl FnMut(u64, u64),
-) -> Result<crate::vault::LibraryEntry> {
-    let Replacement { realm_id, slot, world_dir, stamp, close_first } = *job;
-    on_step("Saving the Realm's current world to your vault");
-    let backup = slot_download(session, realm_id, slot, None)
-        .context("asking the Realm for its current world")?;
-    let temp_backup = vault
-        .exports_dir()
-        .join(format!("realm-{realm_id}-slot{slot}-before-{stamp}.mcworld"));
-    fetch_world(&backup, &temp_backup, on_progress)
-        .context("downloading the Realm's current world")?;
-    let saved = vault
-        .import_mcworld(&temp_backup, stamp)
-        .context("saving the Realm's current world into the vault")?;
-    std::fs::remove_file(&temp_backup).ok();
+) -> Result<Option<crate::vault::LibraryEntry>> {
+    let Replacement { realm_id, slot, world_dir, stamp, close_first, backup_first } = *job;
+
+    let saved = if backup_first {
+        on_step("Saving the Realm's current world to your vault");
+        let backup = slot_download(session, realm_id, slot, None)
+            .context("asking the Realm for its current world")?;
+        let temp_backup = vault
+            .exports_dir()
+            .join(format!("realm-{realm_id}-slot{slot}-before-{stamp}.mcworld"));
+        fetch_world(&backup, &temp_backup, on_progress)
+            .context("downloading the Realm's current world")?;
+        let entry = vault
+            .import_mcworld(&temp_backup, stamp)
+            .context("saving the Realm's current world into the vault")?;
+        std::fs::remove_file(&temp_backup).ok();
+        Some(entry)
+    } else {
+        // Only for a slot that holds nothing: there is no world to lose.
+        None
+    };
 
     on_step("Packing your world");
     let outgoing = vault

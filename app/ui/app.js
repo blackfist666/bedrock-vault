@@ -274,11 +274,30 @@ function realmHero(realm) {
 
   const slots = el("div", "slots");
   for (const slot of detail.slots) {
-    const s = el("div", `slot ${slot.active ? "live" : ""}`);
+    const s = el("div", `slot ${slot.active ? "live" : ""} ${slot.empty ? "empty" : ""}`);
     const shead = el("div", "slot-head");
     shead.append(el("span", "slot-num", `Slot ${slot.slot_id}`));
     if (slot.active) shead.append(el("span", "chip live", "Playing now"));
     s.append(shead);
+
+    // An unused slot: offer to fill it rather than showing a blank card.
+    if (slot.empty) {
+      s.append(el("div", "slot-name empty-name", "No world here yet"));
+      s.append(el("div", "slot-rules",
+        "Put one of your vault worlds here to use this slot."));
+      if (realm.can_download) {
+        const emptyActions = el("div", "row-actions");
+        emptyActions.append(button("Put a world here", {
+          className: "green",
+          help: "Send a world from your vault to this slot.",
+          onClick: () => chooseVaultWorld(realm, slot.slot_id),
+        }));
+        s.append(emptyActions);
+      }
+      slots.append(s);
+      continue;
+    }
+
     s.append(el("div", "slot-name", slot.name));
 
     const facts = el("div", "chips");
@@ -310,6 +329,20 @@ function realmHero(realm) {
 
     if (realm.can_download) {
       const slotActions = el("div", "row-actions");
+      if (!slot.active) {
+        slotActions.append(button("Play this one", {
+          className: "green",
+          help: "Make this the world the Realm runs.",
+          onClick: () => confirmRun(
+            `Switch the Realm to "${slot.name}"?`,
+            "Everyone on the Realm moves to this world. The other slots keep their worlds, and you can switch back at any time.",
+            "Yes, switch", "realm_switch_slot", { realmId: realm.id, slot: slot.slot_id }),
+        }));
+      }
+      slotActions.append(button("Replace", {
+        help: "Put a different world from your vault on this slot.",
+        onClick: () => chooseVaultWorld(realm, slot.slot_id),
+      }));
       slotActions.append(button("Rename", {
         help: "Change the world's name as shown in Minecraft.",
         onClick: () => askText(
@@ -702,7 +735,7 @@ async function run(cmd, args) {
     set_vault_location: "Moving the vault", open_folder: "Opening",
     realms_sign_out: "Signing out", realm_download: "Downloading from the Realm",
     realm_upload: "Sending to the Realm", realm_rename_slot: "Renaming",
-    realm_clear_packs: "Updating the Realm",
+    realm_clear_packs: "Updating the Realm", realm_switch_slot: "Switching world",
   }[cmd] || "Working";
   showProgress(`${label}…`, 0, 0);
   try {
@@ -767,19 +800,24 @@ function askText(title, body, initial, onDone) {
   field.select();
 }
 
-/// Pick which vault world to put on a Realm.
-function chooseVaultWorld(realm) {
+/// Pick which vault world to put on a Realm slot.
+function chooseVaultWorld(realm, slotId) {
   const worlds = (state.data?.vault || []).slice(0, 40);
   if (!worlds.length) {
     banner("Your vault has no worlds to send yet.", "");
     return;
   }
+  const slot = slotId ?? realm.active_slot;
+  const detail = state.realmDetail[realm.id];
+  const target = detail?.slots?.find((s) => s.slot_id === slot);
 
   const modal = document.getElementById("modal");
-  document.getElementById("modal-title").textContent = `Put which world on ${realm.name}?`;
-  document.getElementById("modal-body").textContent =
-    "The world already on the Realm is downloaded into your vault first, so nothing is lost. " +
-    "The Realm closes while the swap happens and reopens afterwards.";
+  document.getElementById("modal-title").textContent =
+    `Put which world on slot ${slot}?`;
+  document.getElementById("modal-body").textContent = target?.empty
+    ? "This slot is empty, so nothing will be replaced. The Realm closes while the world is sent and reopens afterwards."
+    : "The world already on this slot is downloaded into your vault first, so nothing is lost. " +
+      "The Realm closes while the swap happens and reopens afterwards.";
   const ok = document.getElementById("modal-ok");
   const cancel = document.getElementById("modal-cancel");
   ok.style.display = "none";
@@ -789,7 +827,7 @@ function chooseVaultWorld(realm) {
     list.append(button(`${world.name}  ·  ${humanSize(world.size_bytes)}`, {
       onClick: () => {
         close();
-        run("realm_upload", { realmId: realm.id, slot: realm.active_slot, id: world.id });
+        run("realm_upload", { realmId: realm.id, slot, id: world.id });
       },
     }));
   }

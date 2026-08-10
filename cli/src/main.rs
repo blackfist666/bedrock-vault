@@ -94,6 +94,8 @@ enum Cmd {
         slot: Option<i64>,
         name: String,
     },
+    /// Switch which slot the Realm runs
+    RealmSlot { realm: i64, slot: i64 },
     /// Close a Realm (players are disconnected until it is opened again)
     RealmClose { realm: i64 },
     /// Open a Realm again
@@ -203,6 +205,11 @@ fn main() -> Result<()> {
             };
             realms::set_slot_name(&session, realm, slot, &name)?;
             println!("Slot {slot} is now called \"{name}\".");
+            Ok(())
+        }
+        Cmd::RealmSlot { realm, slot } => {
+            realms::switch_to_slot(&realms_session()?, realm, slot)?;
+            println!("Realm {realm} is now running slot {slot}.");
             Ok(())
         }
         Cmd::RealmClose { realm } => {
@@ -471,6 +478,10 @@ fn cmd_realm(realm_id: i64) -> Result<()> {
         println!("  (the service reported none)");
     }
     for slot in &detail.slots {
+        if slot.empty {
+            println!("  Slot {}  (empty)", slot.slot_id);
+            continue;
+        }
         println!(
             "  Slot {}{}  {}",
             slot.slot_id,
@@ -626,6 +637,11 @@ fn cmd_realm_upload(
     let slot = slot
         .or(realm.active_slot)
         .context("could not tell which slot to replace; pass --slot")?;
+    // An empty slot has no world to save first.
+    let occupied = realms::detail(&session, realm_id)?
+        .slots
+        .iter()
+        .any(|s| s.slot_id == slot && !s.empty);
 
     if !yes {
         println!(
@@ -646,6 +662,7 @@ fn cmd_realm_upload(
             world_dir: &entry.world_dir,
             stamp: &stamp(),
             close_first,
+            backup_first: occupied,
         },
         |step| println!("  {step}…"),
         |done, total| {
@@ -659,10 +676,13 @@ fn cmd_realm_upload(
         "\nDone. \"{}\" is now on \"{}\" slot {slot}.",
         entry.name, realm.name
     );
-    println!(
-        "The Realm's previous world was saved to your vault as \"{}\" ({}).",
-        saved.name, saved.id
-    );
+    match saved {
+        Some(saved) => println!(
+            "The Realm's previous world was saved to your vault as \"{}\" ({}).",
+            saved.name, saved.id
+        ),
+        None => println!("That slot was empty, so there was nothing to save first."),
+    }
     Ok(())
 }
 

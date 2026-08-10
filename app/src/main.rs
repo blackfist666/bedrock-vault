@@ -509,6 +509,8 @@ struct SlotDto {
     hardcore: bool,
     seed: Option<String>,
     active: bool,
+    /// No world has ever been put on this slot.
+    empty: bool,
     /// Pack names where installed locally, otherwise a short id.
     packs: Vec<PackRefDto>,
     rules: Vec<[String; 2]>,
@@ -671,6 +673,7 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
                 hardcore: s.hardcore,
                 seed: s.seed,
                 active: s.active,
+                empty: s.empty,
             })
             .collect();
 
@@ -1001,6 +1004,17 @@ async fn realm_rename_slot(realm_id: i64, slot: i64, name: String) -> Result<Str
     .await
 }
 
+/// Switch which slot the Realm runs.
+#[tauri::command]
+async fn realm_switch_slot(realm_id: i64, slot: i64) -> Result<String, String> {
+    blocking(move || {
+        let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
+        realms::switch_to_slot(&session, realm_id, slot).map_err(|e| format!("{e:#}"))?;
+        Ok(format!("The Realm is now playing slot {slot}"))
+    })
+    .await
+}
+
 /// Turn off every add-on on a Realm slot.
 #[tauri::command]
 async fn realm_clear_packs(realm_id: i64, slot: i64) -> Result<String, String> {
@@ -1067,6 +1081,10 @@ async fn realm_upload(
         let slot = slot
             .or(realm.active_slot)
             .ok_or("could not tell which slot to replace")?;
+        // An empty slot has no world to save first.
+        let occupied = realms::detail(&session, realm_id)
+            .map(|d| d.slots.iter().any(|s| s.slot_id == slot && !s.empty))
+            .unwrap_or(true);
 
         let step = |app: &tauri::AppHandle, text: &str| {
             let _ = app.emit(
@@ -1084,16 +1102,20 @@ async fn realm_upload(
                 world_dir: &entry.world_dir,
                 stamp: &stamp(),
                 close_first: true,
+                backup_first: occupied,
             },
             |text| step(&app_for_steps, text),
             |_, _| {},
         )
         .map_err(|e| format!("{e:#}"))?;
 
-        Ok(format!(
-            "\"{}\" is now on {} — its previous world was saved to your vault as \"{}\"",
-            entry.name, realm.name, saved.name
-        ))
+        Ok(match saved {
+            Some(saved) => format!(
+                "\"{}\" is now on {} — its previous world was saved to your vault as \"{}\"",
+                entry.name, realm.name, saved.name
+            ),
+            None => format!("\"{}\" is now on {} slot {slot}", entry.name, realm.name),
+        })
     })
     .await
 }
@@ -1190,7 +1212,7 @@ fn main() {
             restore, import, export, open_folder, set_vault_location, realms_overview,
             realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out,
             realm_download, realm_detail, realm_targets, realm_upload, realm_rename_slot,
-            realm_clear_packs, packs_overview, profile, open_url
+            realm_clear_packs, realm_switch_slot, packs_overview, profile, open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");
