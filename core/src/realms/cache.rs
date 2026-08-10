@@ -15,6 +15,12 @@ use super::auth::{MicrosoftTokens, XstsToken};
 pub struct Session {
     pub microsoft: Option<MicrosoftTokens>,
     pub realms: Option<XstsToken>,
+    /// Xbox Live credential, used for the profile (gamertag, picture).
+    #[serde(default)]
+    pub identity: Option<XstsToken>,
+    /// Cached profile so the picture is not re-fetched on every launch.
+    #[serde(default)]
+    pub profile: Option<super::profile::Profile>,
 }
 
 pub fn path() -> Result<PathBuf> {

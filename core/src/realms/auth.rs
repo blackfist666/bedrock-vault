@@ -241,23 +241,25 @@ fn xsts_for(user_token: &str, relying_party: &str) -> Result<XstsToken> {
     })
 }
 
-/// Full chain: Microsoft access token to a Realms-ready XSTS token.
+/// Full chain: Microsoft access token to the tokens the app needs.
 ///
 /// Two authorisations from the same Xbox user token: one for Realms (the API
-/// credential) and one for Xbox Live (identity). The Realms relying party
-/// returns only a user hash, so without the second call there is no XUID — and
-/// without an XUID, an owned Realm cannot be told from a joined one.
-pub fn realms_session(access_token: &str) -> Result<XstsToken> {
+/// credential) and one for Xbox Live. The Realms relying party returns only a
+/// user hash, so the second call is what supplies the XUID — without which an
+/// owned Realm cannot be told from a joined one — and it is also the credential
+/// the Xbox profile service accepts, for the gamertag and profile picture.
+pub fn realms_session(access_token: &str) -> Result<(XstsToken, Option<XstsToken>)> {
     let user_token = xbox_user_token(access_token)?;
     let mut token = xsts_for(&user_token, REALMS_RELYING_PARTY)?;
 
-    // Best effort: failing to learn the gamertag must not block Realms access.
-    if let Ok(identity) = xsts_for(&user_token, XBOX_LIVE_RELYING_PARTY) {
-        token.gamertag = identity.gamertag;
-        token.xuid = identity.xuid;
-        token.claims = identity.claims;
+    // Best effort: failing to learn who this is must not block Realms access.
+    let identity = xsts_for(&user_token, XBOX_LIVE_RELYING_PARTY).ok();
+    if let Some(id) = &identity {
+        token.gamertag = id.gamertag.clone();
+        token.xuid = id.xuid.clone();
+        token.claims = id.claims.clone();
     }
-    Ok(token)
+    Ok((token, identity))
 }
 
 /// How long to wait between polls.

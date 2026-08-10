@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod cache;
+pub mod profile;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -122,19 +123,38 @@ pub fn session(force_refresh: bool) -> Result<auth::XstsToken> {
     }
 
     let refreshed = auth::refresh(&microsoft.refresh_token)?;
-    let token = auth::realms_session(&refreshed.access_token)?;
+    let (token, identity) = auth::realms_session(&refreshed.access_token)?;
     saved.microsoft = Some(refreshed);
     saved.realms = Some(token.clone());
+    saved.identity = identity;
+    // The picture and gamertag can change; re-read them with the tokens.
+    saved.profile = saved.identity.as_ref().and_then(|id| profile::fetch(id).ok());
     cache::save(&saved)?;
     Ok(token)
 }
 
+/// The signed-in player's profile, fetching it if it is not cached yet.
+pub fn who_am_i() -> Option<profile::Profile> {
+    let mut saved = cache::load();
+    if saved.profile.is_some() {
+        return saved.profile;
+    }
+    let identity = saved.identity.clone()?;
+    let fetched = profile::fetch(&identity).ok()?;
+    saved.profile = Some(fetched.clone());
+    let _ = cache::save(&saved);
+    Some(fetched)
+}
+
 /// Finish a device-code sign-in and save the session.
 pub fn complete_login(tokens: auth::MicrosoftTokens) -> Result<auth::XstsToken> {
-    let token = auth::realms_session(&tokens.access_token)?;
+    let (token, identity) = auth::realms_session(&tokens.access_token)?;
+    let profile = identity.as_ref().and_then(|id| profile::fetch(id).ok());
     cache::save(&cache::Session {
         microsoft: Some(tokens),
         realms: Some(token.clone()),
+        identity,
+        profile,
     })?;
     Ok(token)
 }
@@ -183,6 +203,183 @@ fn realm_from_as(v: &serde_json::Value, my_xuid: Option<&str>) -> Realm {
         player_count: v["players"].as_array().map(|p| p.len() as i64),
         max_players: v["maxPlayers"].as_i64(),
     }
+}
+
+/// One of a Realm's world slots.
+#[derive(Debug, Clone, Serialize)]
+pub struct Slot {
+    pub slot_id: i64,
+    /// The world's name as shown in game.
+    pub name: Option<String>,
+    pub game_mode: Option<String>,
+    pub difficulty: Option<String>,
+    pub hardcore: bool,
+    pub seed: Option<String>,
+    /// Marketplace pack ids this world uses, resource and behavior together.
+    pub pack_ids: Vec<String>,
+    /// Notable game rules, as label/value pairs for display.
+    pub rules: Vec<(String, String)>,
+    /// True when this is the slot the Realm is currently running.
+    pub active: bool,
+}
+
+/// A Realm with everything the detail endpoint knows about it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RealmDetail {
+    pub realm: Realm,
+    pub slots: Vec<Slot>,
+    pub players: Vec<Player>,
+    /// Subscription product id, e.g. the 10-player monthly.
+    pub product: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Player {
+    pub uuid: String,
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub permission: Option<String>,
+    pub online: bool,
+    pub last_login: Option<i64>,
+}
+
+/// Everything the service knows about one Realm.
+pub fn detail(session: &auth::XstsToken, realm_id: i64) -> Result<RealmDetail> {
+    let body = request(session, "GET", &format!("/worlds/{realm_id}"))?;
+    let realm = realm_from_as(&body, session.xuid.as_deref());
+    let active_slot = realm.active_slot;
+
+    let slots = body["slots"]
+        .as_array()
+        .map(|list| list.iter().map(|s| slot_from(s, active_slot)).collect())
+        .unwrap_or_default();
+
+    let players = body["players"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|p| Player {
+                    uuid: p["uuid"].as_str().unwrap_or_default().to_owned(),
+                    name: non_empty(p["name"].as_str()),
+                    role: non_empty(p["role"].as_str()),
+                    permission: non_empty(p["permission"].as_str()),
+                    online: p["online"].as_bool().unwrap_or(false),
+                    last_login: p["lastLogin"].as_i64(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(RealmDetail {
+        realm,
+        slots,
+        players,
+        product: non_empty(body["friendlyId"].as_str()),
+    })
+}
+
+/// Game rules worth showing; the service returns dozens, most of them noise.
+const NOTABLE_RULES: &[(&str, &str)] = &[
+    ("keepinventory", "Keep inventory"),
+    ("pvp", "Player vs player"),
+    ("commandsEnabled", "Cheats"),
+    ("showcoordinates", "Coordinates"),
+    ("doDayLightCycle", "Day/night cycle"),
+    ("dodaylightcycle", "Day/night cycle"),
+    ("doweathercycle", "Weather"),
+    ("domobspawning", "Mob spawning"),
+    ("doimmediaterespawn", "Immediate respawn"),
+    ("doinsomnia", "Phantoms"),
+];
+
+fn slot_from(v: &serde_json::Value, active_slot: Option<i64>) -> Slot {
+    let slot_id = v["slotId"].as_i64().unwrap_or_default();
+
+    // `options` is a JSON *string* holding the interesting fields.
+    let options: serde_json::Value = v["options"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let settings: std::collections::HashMap<String, serde_json::Value> = v["settings"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|s| {
+                    Some((s["name"].as_str()?.to_owned(), s["value"].clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut pack_ids: Vec<String> = ["resourcePacks", "behaviorPacks"]
+        .iter()
+        .filter_map(|key| options["enabledPacks"][key].as_array())
+        .flatten()
+        .filter_map(|p| p.as_str().map(str::to_owned))
+        .collect();
+    pack_ids.sort();
+    pack_ids.dedup();
+
+    let rules = NOTABLE_RULES
+        .iter()
+        .filter_map(|(key, label)| {
+            let value = settings.get(*key)?;
+            let text = match value {
+                serde_json::Value::Bool(b) => if *b { "on" } else { "off" }.to_owned(),
+                other => other.as_i64().map(|n| n.to_string())?,
+            };
+            Some(((*label).to_owned(), text))
+        })
+        .collect::<Vec<_>>();
+
+    Slot {
+        name: non_empty(options["slotName"].as_str()),
+        game_mode: game_mode_name(
+            options["gameMode"].as_i64().or_else(|| settings.get("GameType")?.as_i64()),
+        ),
+        difficulty: difficulty_name(
+            options["difficulty"].as_i64().or_else(|| settings.get("Difficulty")?.as_i64()),
+        ),
+        hardcore: options["hardcore"].as_bool().unwrap_or(false)
+            || settings.get("IsHardcore").and_then(|v| v.as_bool()).unwrap_or(false),
+        seed: settings.get("RandomSeed").and_then(|v| v.as_i64()).map(|n| n.to_string()),
+        pack_ids,
+        rules: dedupe_rules(rules),
+        active: Some(slot_id) == active_slot,
+        slot_id,
+    }
+}
+
+/// Two spellings of the same rule arrive from different parts of the payload.
+fn dedupe_rules(rules: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    rules.into_iter().filter(|(label, _)| seen.insert(label.clone())).collect()
+}
+
+fn game_mode_name(n: Option<i64>) -> Option<String> {
+    Some(
+        match n? {
+            0 => "Survival",
+            1 => "Creative",
+            2 => "Adventure",
+            _ => return None,
+        }
+        .to_owned(),
+    )
+}
+
+fn difficulty_name(n: Option<i64>) -> Option<String> {
+    Some(
+        match n? {
+            0 => "Peaceful",
+            1 => "Easy",
+            2 => "Normal",
+            3 => "Hard",
+            _ => return None,
+        }
+        .to_owned(),
+    )
 }
 
 /// One stored backup of a Realm slot.
@@ -315,8 +512,53 @@ pub fn fetch_world(
 }
 
 /// Close a Realm so its world can be replaced.
+///
+/// Returns as soon as the request is accepted; see [`close_and_wait`] for the
+/// version that confirms the Realm actually went offline.
 pub fn close(session: &auth::XstsToken, realm_id: i64) -> Result<()> {
     request(session, "PUT", &format!("/worlds/{realm_id}/close")).map(|_| ())
+}
+
+/// The Realm's current `OPEN`/`CLOSED` state.
+pub fn state(session: &auth::XstsToken, realm_id: i64) -> Result<String> {
+    let body = request(session, "GET", &format!("/worlds/{realm_id}"))?;
+    Ok(body["state"].as_str().unwrap_or("UNKNOWN").to_owned())
+}
+
+/// Close a Realm and wait until the service confirms it is offline.
+///
+/// Closing is **asynchronous**: the service answers 503 "Retry again later"
+/// while it shuts the server down, yet the close does happen. Taking that 503
+/// at face value made the upload look permanently broken, when in truth it only
+/// needed to wait and re-read the state.
+pub fn close_and_wait(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    mut on_wait: impl FnMut(u64),
+) -> Result<()> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(4);
+    const ATTEMPTS: u64 = 20;
+
+    // A 503 here means "working on it", so it is not an error yet.
+    if let Err(e) = close(session, realm_id) {
+        let message = format!("{e:#}");
+        if !message.contains("busy or unavailable") {
+            return Err(e);
+        }
+    }
+
+    for attempt in 1..=ATTEMPTS {
+        std::thread::sleep(POLL);
+        match state(session, realm_id)?.as_str() {
+            "CLOSED" => return Ok(()),
+            _ => on_wait(attempt * POLL.as_secs()),
+        }
+        // Nudge it again halfway through, in case the first call was dropped.
+        if attempt == ATTEMPTS / 2 {
+            let _ = close(session, realm_id);
+        }
+    }
+    bail!("the Realm did not close in time — try again in a minute")
 }
 
 /// Reopen a Realm.
@@ -450,7 +692,10 @@ pub fn replace_slot_world(
     let mut closed = false;
     if close_first {
         on_step("Closing the Realm");
-        close(session, realm_id).context("closing the Realm")?;
+        close_and_wait(session, realm_id, |secs| {
+            on_step(&format!("Waiting for the Realm to close ({secs}s)"));
+        })
+        .context("closing the Realm")?;
         closed = true;
     }
 

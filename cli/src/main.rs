@@ -50,6 +50,11 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
+    /// Show everything about one Realm: slots, worlds, packs, players
+    Realm {
+        /// Realm id shown by `realms`
+        realm: i64,
+    },
     /// List the backups a Realm holds
     RealmBackups {
         /// Realm id shown by `realms`
@@ -165,6 +170,7 @@ fn main() -> Result<()> {
         }
         Cmd::Account { refresh, raw } => cmd_account(refresh, raw),
         Cmd::Realms { raw } => cmd_realms(raw),
+        Cmd::Realm { realm } => cmd_realm(realm),
         Cmd::RealmBackups { realm } => cmd_realm_backups(realm),
         Cmd::RealmDownload { realm, slot, backup } => {
             cmd_realm_download(vault_root, realm, slot, backup.as_deref())
@@ -318,12 +324,11 @@ fn cmd_login() -> Result<()> {
         }
     };
 
-    let session = realms::auth::realms_session(&tokens.access_token)?;
-    let who = session.gamertag.clone().unwrap_or_else(|| "your account".into());
-    realms::cache::save(&realms::cache::Session {
-        microsoft: Some(tokens),
-        realms: Some(session),
-    })?;
+    let session = realms::complete_login(tokens)?;
+    let who = realms::who_am_i()
+        .map(|p| p.gamertag)
+        .or_else(|| session.gamertag.clone())
+        .unwrap_or_else(|| "your account".into());
     println!("\nSigned in as {who}.");
     Ok(())
 }
@@ -334,27 +339,7 @@ fn realms_session() -> Result<realms::auth::XstsToken> {
 }
 
 fn session_with_refresh(force: bool) -> Result<realms::auth::XstsToken> {
-    let mut session = realms::cache::load();
-    let microsoft = session
-        .microsoft
-        .clone()
-        .context("not signed in — run `vault login` first")?;
-
-    if let Some(realms_token) = &session.realms {
-        // A token saved before the XUID was captured cannot answer "is this
-        // Realm mine?", so treat it as stale too.
-        if !force && !realms_token.is_expired() && realms_token.xuid.is_some() {
-            return Ok(realms_token.clone());
-        }
-    }
-
-    println!("Refreshing sign-in…");
-    let refreshed = realms::auth::refresh(&microsoft.refresh_token)?;
-    let token = realms::auth::realms_session(&refreshed.access_token)?;
-    session.microsoft = Some(refreshed);
-    session.realms = Some(token.clone());
-    realms::cache::save(&session)?;
-    Ok(token)
+    realms::session(force).context("not signed in — run `vault login` first")
 }
 
 fn cmd_account(refresh: bool, raw: bool) -> Result<()> {
@@ -430,6 +415,89 @@ fn cmd_realms(raw: bool) -> Result<()> {
         println!("Only a Realm's owner can replace its world, so uploads will be limited to yours.");
     }
     Ok(())
+}
+
+fn cmd_realm(realm_id: i64) -> Result<()> {
+    let session = realms_session()?;
+    let detail = realms::detail(&session, realm_id)?;
+    let packs = installed_pack_index();
+
+    println!("{}", detail.realm.name);
+    println!(
+        "  {} · {} · up to {} players · {}",
+        if detail.realm.owner == Some(true) { "yours" } else { "joined" },
+        detail.realm.subscription(),
+        detail.realm.max_players.unwrap_or(0),
+        if detail.realm.state == "OPEN" { "open" } else { "closed" },
+    );
+
+    println!("\nWORLD SLOTS");
+    if detail.slots.is_empty() {
+        println!("  (the service reported none)");
+    }
+    for slot in &detail.slots {
+        println!(
+            "  Slot {}{}  {}",
+            slot.slot_id,
+            if slot.active { " (live)" } else { "" },
+            slot.name.as_deref().unwrap_or("<unnamed>"),
+        );
+        let mut bits = Vec::new();
+        if let Some(m) = &slot.game_mode {
+            bits.push(m.clone());
+        }
+        if let Some(d) = &slot.difficulty {
+            bits.push(d.clone());
+        }
+        if slot.hardcore {
+            bits.push("Hardcore".into());
+        }
+        if let Some(s) = &slot.seed {
+            bits.push(format!("seed {s}"));
+        }
+        if !bits.is_empty() {
+            println!("      {}", bits.join(" · "));
+        }
+        if !slot.pack_ids.is_empty() {
+            let named: Vec<String> = slot
+                .pack_ids
+                .iter()
+                .map(|id| packs.get(id).cloned().unwrap_or_else(|| format!("{id} (not installed here)")))
+                .collect();
+            println!("      Packs: {}", named.join(", "));
+        }
+        if !slot.rules.is_empty() {
+            let rules: Vec<String> =
+                slot.rules.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+            println!("      {}", rules.join(" · "));
+        }
+    }
+
+    println!("\nPLAYERS");
+    for p in &detail.players {
+        println!(
+            "  {:<22} {:<10} {}",
+            p.name.as_deref().unwrap_or("(gamertag hidden)"),
+            p.role.as_deref().unwrap_or("-"),
+            p.last_login.map(fmt_time).unwrap_or_else(|| "never".into()),
+        );
+    }
+    Ok(())
+}
+
+/// Marketplace pack ids to names, matching both dashed and undashed uuids —
+/// Realm slots report ids without dashes, manifests use them with.
+fn installed_pack_index() -> std::collections::HashMap<String, String> {
+    let mut index = std::collections::HashMap::new();
+    for (_, cache) in packs::find_premium_caches() {
+        if let Ok((found, _)) = packs::scan_premium_cache(&cache) {
+            for p in found {
+                index.insert(p.uuid.replace('-', ""), p.name.clone());
+                index.insert(p.uuid, p.name);
+            }
+        }
+    }
+    index
 }
 
 fn cmd_realm_backups(realm: i64) -> Result<()> {
