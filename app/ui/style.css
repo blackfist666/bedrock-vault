@@ -17,11 +17,16 @@
   --red: #a63a34;
   --red-hi: #c14a42;
   --amber: #d8973c;
-  /* Realms purple. Anything that reaches out to a Realm wears it, so at a
-     glance it is obvious which buttons touch the Realm and which stay local. */
+  /* Buttons are coloured by what they touch, so it is obvious at a glance
+     where an action lands: green for Minecraft on this PC, red for the vault,
+     purple for a Realm. Orange overrides all three for anything that destroys
+     or disables something. */
   --purple: #7d3fb5;
   --purple-hi: #9152cc;
   --purple-edge: #4a2470;
+  --orange: #b8701e;
+  --orange-hi: #d18426;
+  --orange-edge: #74440f;
 }
 
 * { box-sizing: border-box; }
@@ -218,6 +223,8 @@ header {
 .mc-btn.red:hover:not(:disabled) { background: var(--red-hi); }
 .mc-btn.purple { background: var(--purple); border-bottom-color: var(--purple-edge); }
 .mc-btn.purple:hover:not(:disabled) { background: var(--purple-hi); }
+.mc-btn.orange { background: var(--orange); border-bottom-color: var(--orange-edge); }
+.mc-btn.orange:hover:not(:disabled) { background: var(--orange-hi); }
 .mc-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .mc-btn.small { padding: 7px 13px; font-size: 13px; }
 
