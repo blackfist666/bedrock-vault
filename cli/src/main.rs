@@ -91,6 +91,13 @@ enum Cmd {
     RealmClose { realm: i64 },
     /// Open a Realm again
     RealmOpen { realm: i64 },
+    /// GET any Xbox service URL with the Xbox Live credential (exploration)
+    Xapi {
+        url: String,
+        /// x-xbl-contract-version header value
+        #[arg(long, default_value = "2")]
+        contract: String,
+    },
     /// Read any Realms API path (GET only) — for exploring an undocumented API
     Api {
         /// Path such as /worlds/12345 or /worlds/12345/backups
@@ -186,6 +193,14 @@ fn main() -> Result<()> {
         Cmd::RealmOpen { realm } => {
             realms::open(&realms_session()?, realm)?;
             println!("Realm {realm} is open.");
+            Ok(())
+        }
+        Cmd::Xapi { url, contract } => {
+            let session = realms::cache::load()
+                .identity
+                .context("no Xbox Live token — run `vault login`")?;
+            let body = realms::xbox_get(&session, &url, &contract)?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
         Cmd::Api { path } => {

@@ -154,10 +154,16 @@ function vaultRows() {
   return state.data.vault.filter((w) => matches(w.name)).map((w) => {
     const actions = [];
     if (!w.in_game) {
-      actions.push(button("Play", {
+      actions.push(button("Play here", {
         className: "green", disabled: blocked, disabledReason: reason,
-        help: "Put this world into Minecraft so you can play it.",
+        help: "Copy this world into Minecraft on this PC, so it appears in your single-player world list.",
         onClick: () => run("play", { id: w.id }),
+      }));
+    }
+    if (state.realmTargets && state.realmTargets.length) {
+      actions.push(button("Send to Realm", {
+        help: "Put this world onto one of your Realms, so everyone can play it.",
+        onClick: () => chooseRealm(w),
       }));
     }
     actions.push(button("Back up", {
@@ -238,7 +244,6 @@ function realmHero(realm) {
 
   const actions = el("div", "row-actions");
   if (realm.can_download) {
-    actions.push = null;
     actions.append(button("Copy world to vault", {
       className: "green",
       help: "Download this Realm's current world into your vault. Nothing on the Realm changes.",
@@ -247,6 +252,10 @@ function realmHero(realm) {
         "The Realm's current world is downloaded and added to your vault as a new world. Nothing on the Realm itself is changed.",
         "Yes, copy it", "realm_download",
         { realmId: realm.id, slot: realm.active_slot, name: realm.name }),
+    }));
+    actions.append(button("Put a vault world here", {
+      help: "Replace this Realm's world with one from your vault.",
+      onClick: () => chooseVaultWorld(realm),
     }));
   }
   head.append(actions);
@@ -566,6 +575,14 @@ async function loadProfile() {
   renderAccount();
 }
 
+async function loadRealmTargets() {
+  try {
+    state.realmTargets = await invoke("realm_targets");
+  } catch {
+    state.realmTargets = [];
+  }
+}
+
 async function loadRealms() {
   try {
     state.realms = await invoke("realms_overview");
@@ -576,6 +593,7 @@ async function loadRealms() {
       ? (r.mine.length ? `${r.mine.length} active of ${total}` : `${total} Realm${total === 1 ? "" : "s"}`)
       : "not signed in";
     state.profile = r.profile || state.profile;
+    state.realmTargets = r.mine;
     renderAccount();
   } catch (e) {
     banner(String(e), "error");
@@ -658,6 +676,7 @@ async function run(cmd, args) {
     restore: "Restoring", delete: "Deleting", import: "Importing",
     set_vault_location: "Moving the vault", open_folder: "Opening",
     realms_sign_out: "Signing out", realm_download: "Downloading from the Realm",
+    realm_upload: "Sending to the Realm",
   }[cmd] || "Working";
   showProgress(`${label}…`, 0, 0);
   try {
@@ -670,7 +689,7 @@ async function run(cmd, args) {
       await loadRealms();
     } else {
       await load();
-      if (cmd === "realm_download") await loadRealms();
+      if (cmd === "realm_download" || cmd === "realm_upload") await loadRealms();
     }
     if (message) banner(message, "ok");
   } catch (e) {
@@ -682,6 +701,98 @@ async function run(cmd, args) {
   }
 }
 
+/// Pick which vault world to put on a Realm.
+function chooseVaultWorld(realm) {
+  const worlds = (state.data?.vault || []).slice(0, 40);
+  if (!worlds.length) {
+    banner("Your vault has no worlds to send yet.", "");
+    return;
+  }
+
+  const modal = document.getElementById("modal");
+  document.getElementById("modal-title").textContent = `Put which world on ${realm.name}?`;
+  document.getElementById("modal-body").textContent =
+    "The world already on the Realm is downloaded into your vault first, so nothing is lost. " +
+    "The Realm closes while the swap happens and reopens afterwards.";
+  const ok = document.getElementById("modal-ok");
+  const cancel = document.getElementById("modal-cancel");
+  ok.style.display = "none";
+
+  const list = el("div", "realm-choices scroll");
+  for (const world of worlds) {
+    list.append(button(`${world.name}  ·  ${humanSize(world.size_bytes)}`, {
+      onClick: () => {
+        close();
+        run("realm_upload", { realmId: realm.id, slot: realm.active_slot, id: world.id });
+      },
+    }));
+  }
+  const box = document.querySelector(".modal-actions");
+  box.parentElement.insertBefore(list, box);
+
+  const close = () => {
+    modal.className = "modal hidden";
+    list.remove();
+    ok.style.display = "";
+    cancel.onclick = null;
+    document.onkeydown = null;
+  };
+  cancel.onclick = close;
+  document.onkeydown = (e) => { if (e.key === "Escape") close(); };
+  modal.className = "modal";
+}
+
+/// Pick which Realm a vault world goes onto, then confirm the replacement.
+function chooseRealm(world) {
+  const targets = state.realmTargets || [];
+  if (!targets.length) {
+    banner("You have no Realm of your own running to send a world to.", "");
+    return;
+  }
+  if (targets.length === 1) {
+    const realm = targets[0];
+    confirmRun(
+      `Put "${world.name}" on ${realm.name}?`,
+      `This replaces the world currently on ${realm.name}. That world is downloaded into your vault first, ` +
+      "so nothing is lost, and the Realm is closed while the swap happens and reopened afterwards.",
+      "Yes, send it", "realm_upload", { realmId: realm.id, slot: realm.active_slot, id: world.id });
+    return;
+  }
+
+  // More than one Realm: ask which.
+  const modal = document.getElementById("modal");
+  document.getElementById("modal-title").textContent = `Send "${world.name}" to which Realm?`;
+  document.getElementById("modal-body").textContent =
+    "The world already on it is downloaded into your vault first, so nothing is lost.";
+  const ok = document.getElementById("modal-ok");
+  const cancel = document.getElementById("modal-cancel");
+  ok.style.display = "none";
+
+  const list = el("div", "realm-choices");
+  for (const realm of targets) {
+    list.append(button(realm.name, {
+      className: "green",
+      onClick: () => {
+        close();
+        run("realm_upload", { realmId: realm.id, slot: realm.active_slot, id: world.id });
+      },
+    }));
+  }
+  const box = document.querySelector(".modal-actions");
+  box.parentElement.insertBefore(list, box);
+
+  const close = () => {
+    modal.className = "modal hidden";
+    list.remove();
+    ok.style.display = "";
+    cancel.onclick = null;
+    document.onkeydown = null;
+  };
+  cancel.onclick = close;
+  document.onkeydown = (e) => { if (e.key === "Escape") close(); };
+  modal.className = "modal";
+}
+
 function confirmRun(title, body, okLabel, cmd, args) {
   const modal = document.getElementById("modal");
   document.getElementById("modal-title").textContent = title;
@@ -689,6 +800,7 @@ function confirmRun(title, body, okLabel, cmd, args) {
   const ok = document.getElementById("modal-ok");
   const cancel = document.getElementById("modal-cancel");
   ok.textContent = okLabel;
+  ok.style.display = "";
 
   const close = () => {
     modal.className = "modal hidden";

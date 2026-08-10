@@ -720,6 +720,32 @@ pub fn replace_slot_world(
     Ok(saved)
 }
 
+/// GET any Xbox service with the Xbox Live credential.
+///
+/// Xbox splits its services across hosts (profile, inventory, catalogue), each
+/// wanting its own `x-xbl-contract-version`; this is how they get explored.
+pub fn xbox_get(
+    identity: &auth::XstsToken,
+    url: &str,
+    contract: &str,
+) -> Result<serde_json::Value> {
+    let response = ureq::get(url)
+        .set("Authorization", &identity.authorization())
+        .set("x-xbl-contract-version", contract)
+        .set("Accept", "application/json")
+        .set("Accept-Language", "en-GB")
+        .call();
+
+    match response {
+        Ok(ok) => Ok(ok.into_json().unwrap_or(serde_json::Value::Null)),
+        Err(ureq::Error::Status(code, resp)) => {
+            let detail: String = resp.into_string().unwrap_or_default().chars().take(400).collect();
+            Err(anyhow!("HTTP {code}: {detail}"))
+        }
+        Err(ureq::Error::Transport(t)) => Err(anyhow!("could not reach it: {t}")),
+    }
+}
+
 /// An authenticated **GET** against any Realms path.
 ///
 /// The API is unofficial and undocumented, so exploring it against a live

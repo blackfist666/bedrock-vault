@@ -250,6 +250,38 @@ fn version_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// Pack names a world remembers, keyed by uuid (dashes stripped).
+///
+/// Worlds keep a `world_*_pack_history.json` naming every pack they have ever
+/// used — including marketplace content that was never downloaded to this PC.
+/// It is a far better source than the local cache: a world pulled from a Realm
+/// names its add-ons even though nothing is installed here.
+pub fn names_from_history(world_dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for file in ["world_resource_pack_history.json", "world_behavior_pack_history.json"] {
+        let Ok(raw) = fs::read_to_string(world_dir.join(file)) else { continue };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
+        else {
+            continue;
+        };
+        let Some(packs) = json["packs"].as_array() else { continue };
+        for pack in packs {
+            // `name` is a map of locale to text; any entry beats none.
+            let name = pack["name"]["en_US"]
+                .as_str()
+                .or_else(|| pack["name"].as_object()?.values().find_map(|v| v.as_str()))
+                .or_else(|| pack["name"].as_str());
+            let Some(name) = name.filter(|n| !n.is_empty()) else { continue };
+            for key in ["uuid", "source_uuid"] {
+                if let Some(id) = pack[key].as_str().filter(|s| !s.is_empty()) {
+                    out.push((id.replace('-', ""), name.to_owned()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Read a world's pack references: (resource, behavior).
 pub fn world_pack_refs(world_dir: &Path) -> (Vec<PackRef>, Vec<PackRef>) {
     (
@@ -314,6 +346,30 @@ mod tests {
         assert_eq!(packs[0].version, "1.0.12");
         assert_eq!(packs[0].category, "resource_packs");
         assert_eq!(persona, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A world downloaded from a Realm names its add-ons even when none of
+    /// them are installed on this PC.
+    #[test]
+    fn reads_pack_names_from_world_history() {
+        let root = std::env::temp_dir().join(format!("vault-hist-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("world_resource_pack_history.json"),
+            r#"{"packs":[{"can_be_redownloaded":true,"name":{"en_US":"1 Block Skyblock"},
+                "source_uuid":"e01c8aeb-660c-4a8b-a614-9184dd35c488",
+                "uuid":"c46327e2-fa4b-4c6d-bc7e-13abc579d54f","version":[1,0,8]}]}"#,
+        )
+        .unwrap();
+
+        let names = names_from_history(&root);
+        assert!(names.iter().all(|(_, n)| n == "1 Block Skyblock"));
+        // Both the pack's own id and its marketplace id resolve, dashless.
+        assert!(names.iter().any(|(id, _)| id == "c46327e2fa4b4c6dbc7e13abc579d54f"));
+        assert!(names.iter().any(|(id, _)| id == "e01c8aeb660c4a8ba6149184dd35c488"));
 
         let _ = fs::remove_dir_all(&root);
     }

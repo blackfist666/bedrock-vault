@@ -360,6 +360,9 @@ footer { padding: 4px 20px 20px; color: var(--muted); font-size: 12px; }
 .modal-box h3 { margin: 0 0 10px; font-size: 17px; }
 .modal-box p { margin: 0 0 20px; color: var(--muted); font-size: 13.5px; }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.realm-choices { display: flex; flex-direction: column; gap: 7px; margin-bottom: 18px; }
+.realm-choices.scroll { max-height: 46vh; overflow-y: auto; }
+.realm-choices .mc-btn { text-align: left; }
 
 /* Must be last and more specific than any rule that sets `display`, otherwise
    an element like .progress or .modal stays on screen when hidden. */
