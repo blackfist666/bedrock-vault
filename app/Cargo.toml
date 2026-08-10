@@ -19,3 +19,5 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+# File picker for "Import a world…" (.mcworld from Downloads, a Switch export, …)
+tauri-plugin-dialog = "2"

@@ -13,17 +13,50 @@
 
     <div id="banner" class="banner hidden"></div>
 
-    <nav class="tabs">
-      <button class="tab active" data-filter="all">All worlds</button>
-      <button class="tab" data-filter="active">In game</button>
-      <button class="tab" data-filter="library">Vault</button>
-      <input id="search" type="search" placeholder="Search worlds…" />
-      <button id="refresh" class="ghost">Refresh</button>
+    <div id="progress" class="progress hidden">
+      <div class="progress-text"><span id="progress-label"></span><span id="progress-count"></span></div>
+      <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+    </div>
+
+    <nav class="steps">
+      <button class="step active" data-section="live">
+        <span class="step-name">In Minecraft</span>
+        <span class="step-sub" id="count-live"></span>
+      </button>
+      <span class="arrow">→</span>
+      <button class="step" data-section="vault">
+        <span class="step-name">Vault</span>
+        <span class="step-sub" id="count-vault"></span>
+      </button>
+      <span class="arrow">→</span>
+      <button class="step" data-section="backups">
+        <span class="step-name">Backups</span>
+        <span class="step-sub" id="count-backups"></span>
+      </button>
     </nav>
+
+    <section class="bar">
+      <p id="explain" class="explain"></p>
+      <div class="bar-actions">
+        <input id="search" type="search" placeholder="Find a world…" />
+        <button id="main-action" class="big"></button>
+      </div>
+    </section>
 
     <main id="grid" class="grid"></main>
 
     <footer id="footer"></footer>
+
+    <div id="modal" class="modal hidden">
+      <div class="modal-box">
+        <h3 id="modal-title"></h3>
+        <p id="modal-body"></p>
+        <div class="modal-actions">
+          <button id="modal-cancel" class="ghost">No, go back</button>
+          <button id="modal-ok" class="big"></button>
+        </div>
+      </div>
+    </div>
 
     <script src="app.js"></script>
   </body>

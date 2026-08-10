@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bedrock_vault_core::{guard, level_dat, mcworld, packs, scan, vault::Vault};
+use bedrock_vault_core::{
+    guard, level_dat, mcworld, packs, scan,
+    vault::{Protection, Vault},
+};
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 
@@ -29,7 +32,27 @@ enum Cmd {
     Guard,
     /// List worlds held in the vault library
     Library,
-    /// Move a live world out of minecraftWorlds into the library
+    /// Copy a live world into the vault (or refresh its copy), keeping it in game
+    Protect {
+        /// Live world folder, or the folder id shown by `scan`; omit for all
+        world: Option<String>,
+    },
+    /// List snapshot history for a vault world
+    Snapshots {
+        /// Library id shown by `library`
+        id: String,
+    },
+    /// Rebuild a world from a snapshot as a new vault entry
+    Restore {
+        /// Path to a .mcworld snapshot
+        snapshot: PathBuf,
+    },
+    /// Remove a world from the vault, keeping a final snapshot
+    Delete {
+        /// Library id shown by `library`
+        id: String,
+    },
+    /// Protect a world and remove it from the in-game list
     Archive {
         /// Live world folder, or the folder id shown by `scan`
         world: String,
@@ -65,6 +88,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Library => cmd_library(vault_root),
+        Cmd::Protect { world } => cmd_protect(vault_root, world.as_deref()),
+        Cmd::Snapshots { id } => cmd_snapshots(vault_root, &id),
+        Cmd::Restore { snapshot } => cmd_restore(vault_root, &snapshot),
+        Cmd::Delete { id } => cmd_delete(vault_root, &id),
         Cmd::Archive { world } => cmd_archive(vault_root, &world),
         Cmd::Activate { id } => cmd_activate(vault_root, &id),
         Cmd::Import { path } => cmd_import(vault_root, &path),
@@ -190,28 +217,115 @@ fn cmd_library(root: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Accept either a full path or a `minecraftWorlds` folder id.
-fn resolve_live_world(world: &str) -> Result<PathBuf> {
+/// Accept either a full path or a `minecraftWorlds` folder id; returns both the
+/// path and the folder id, which is how the vault links a copy to a live world.
+fn resolve_live_world_with_id(world: &str) -> Result<(PathBuf, String)> {
     let direct = PathBuf::from(world);
     if direct.join("level.dat").is_file() {
-        return Ok(direct);
+        let id = direct
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .context("world path has no folder name")?;
+        return Ok((direct, id));
     }
     for loc in scan::find_worlds_dirs()? {
         let candidate = loc.path.join(world);
         if candidate.join("level.dat").is_file() {
-            return Ok(candidate);
+            return Ok((candidate, world.to_owned()));
         }
     }
     anyhow::bail!("no world folder found for '{world}'")
 }
 
+/// Protect one world, or every world that needs it.
+fn cmd_protect(root: Option<PathBuf>, world: Option<&str>) -> Result<()> {
+    let vault = open_vault(root)?;
+    if let Some(world) = world {
+        let (live, folder) = resolve_live_world_with_id(world)?;
+        let entry = vault.protect(&live, &folder, &stamp())?;
+        println!(
+            "Protected \"{}\" as {} ({}) — still in your game.",
+            entry.name,
+            entry.id,
+            human_size(entry.size_bytes)
+        );
+        return Ok(());
+    }
+
+    let mut done = 0;
+    for loc in scan::find_worlds_dirs()? {
+        if !loc.path.is_dir() {
+            continue;
+        }
+        for w in scan::scan(&loc.path)? {
+            let last_played = w.meta.as_ref().ok().and_then(|m| m.last_played);
+            if vault.protection(&w.folder, last_played)? == Protection::Protected {
+                continue;
+            }
+            let entry = vault.protect(&loc.path.join(&w.folder), &w.folder, &stamp())?;
+            println!("  protected \"{}\" ({})", entry.name, human_size(entry.size_bytes));
+            done += 1;
+        }
+    }
+    println!(
+        "{}",
+        match done {
+            0 => "Every world was already protected.".to_owned(),
+            n => format!("Protected {n} world(s)."),
+        }
+    );
+    Ok(())
+}
+
+fn cmd_snapshots(root: Option<PathBuf>, id: &str) -> Result<()> {
+    let vault = open_vault(root)?;
+    let entry = vault.entry(id)?;
+    let snaps = vault.snapshots(&entry);
+    println!("Snapshots for \"{}\" ({}):\n", entry.name, entry.id);
+    if snaps.is_empty() {
+        println!("  (none)");
+        return Ok(());
+    }
+    for s in &snaps {
+        println!("  {:<26} {:>9}  {}", s.stamp, human_size(s.size_bytes), s.path.display());
+    }
+    println!(
+        "\n{} snapshot(s); retention keeps {} per world.",
+        snaps.len(),
+        vault.settings.snapshot_retention
+    );
+    Ok(())
+}
+
+fn cmd_restore(root: Option<PathBuf>, snapshot: &std::path::Path) -> Result<()> {
+    let vault = open_vault(root)?;
+    let entry = vault.restore_snapshot(snapshot, &stamp())?;
+    println!(
+        "Restored \"{}\" as {} — a new vault world; activate it to play it.",
+        entry.name, entry.id
+    );
+    Ok(())
+}
+
+fn cmd_delete(root: Option<PathBuf>, id: &str) -> Result<()> {
+    let vault = open_vault(root)?;
+    let entry = vault.entry(id)?;
+    let backup = vault.delete(id, &stamp())?;
+    println!(
+        "Removed \"{}\" from the vault. Final snapshot: {}",
+        entry.name,
+        backup.display()
+    );
+    Ok(())
+}
+
 fn cmd_archive(root: Option<PathBuf>, world: &str) -> Result<()> {
     let vault = open_vault(root)?;
-    let live = resolve_live_world(world)?;
+    let (live, folder) = resolve_live_world_with_id(world)?;
     println!("Archiving {} …", live.display());
-    let entry = vault.archive(&live, &stamp())?;
+    let entry = vault.archive(&live, &folder, &stamp())?;
     println!(
-        "Archived \"{}\" as {} ({}) — backup taken, removed from the in-game list.",
+        "Archived \"{}\" as {} ({}) — in the vault, out of the in-game list.",
         entry.name,
         entry.id,
         human_size(entry.size_bytes)
