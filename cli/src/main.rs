@@ -537,11 +537,13 @@ fn cmd_realm_upload(
     let saved = realms::replace_slot_world(
         &session,
         &vault,
-        realm_id,
-        slot,
-        &entry.world_dir,
-        &stamp(),
-        close_first,
+        &realms::Replacement {
+            realm_id,
+            slot,
+            world_dir: &entry.world_dir,
+            stamp: &stamp(),
+            close_first,
+        },
         |step| println!("  {step}…"),
         |done, total| {
             if total > 0 && done == total {

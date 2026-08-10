@@ -409,17 +409,25 @@ fn send_world(url: &str, token: &str, method: &str, bytes: &[u8]) -> Result<(), 
 /// 3. Upload.
 /// 4. Reopen — attempted even when the upload fails, so a failure never leaves
 ///    the Realm shut.
+pub struct Replacement<'a> {
+    pub realm_id: i64,
+    pub slot: i64,
+    /// The vault world to put on the Realm.
+    pub world_dir: &'a std::path::Path,
+    pub stamp: &'a str,
+    /// Close the Realm before uploading. Realms requires it; only testing has
+    /// reason to skip it.
+    pub close_first: bool,
+}
+
 pub fn replace_slot_world(
     session: &auth::XstsToken,
     vault: &crate::vault::Vault,
-    realm_id: i64,
-    slot: i64,
-    world_dir: &std::path::Path,
-    stamp: &str,
-    close_first: bool,
+    job: &Replacement<'_>,
     mut on_step: impl FnMut(&str),
     on_progress: impl FnMut(u64, u64),
 ) -> Result<crate::vault::LibraryEntry> {
+    let Replacement { realm_id, slot, world_dir, stamp, close_first } = *job;
     on_step("Saving the Realm's current world to your vault");
     let backup = slot_download(session, realm_id, slot, None)
         .context("asking the Realm for its current world")?;
