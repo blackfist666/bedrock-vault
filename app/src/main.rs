@@ -511,6 +511,9 @@ struct SlotDto {
     active: bool,
     /// No world has ever been put on this slot.
     empty: bool,
+    /// Whether Minecraft will hand this slot's world over, which is what makes
+    /// a backup-before-replacing possible.
+    can_backup: bool,
     /// Pack names where installed locally, otherwise a short id.
     packs: Vec<PackRefDto>,
     rules: Vec<[String; 2]>,
@@ -673,6 +676,7 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
                 hardcore: s.hardcore,
                 seed: s.seed,
                 active: s.active,
+                can_backup: !s.empty && realms::slot_is_downloadable(&session, realm_id, s.slot_id),
                 empty: s.empty,
             })
             .collect();
@@ -1081,10 +1085,13 @@ async fn realm_upload(
         let slot = slot
             .or(realm.active_slot)
             .ok_or("could not tell which slot to replace")?;
-        // An empty slot has no world to save first.
+        // Back up first whenever there is something Minecraft will actually
+        // hand over — an empty slot has nothing, and a freshly-uploaded world
+        // has no stored copy yet.
         let occupied = realms::detail(&session, realm_id)
             .map(|d| d.slots.iter().any(|s| s.slot_id == slot && !s.empty))
             .unwrap_or(true);
+        let backup_first = occupied && realms::slot_is_downloadable(&session, realm_id, slot);
 
         let step = |app: &tauri::AppHandle, text: &str| {
             let _ = app.emit(
@@ -1102,7 +1109,7 @@ async fn realm_upload(
                 world_dir: &entry.world_dir,
                 stamp: &stamp(),
                 close_first: true,
-                backup_first: occupied,
+                backup_first,
             },
             |text| step(&app_for_steps, text),
             |_, _| {},
@@ -1113,6 +1120,10 @@ async fn realm_upload(
             Some(saved) => format!(
                 "\"{}\" is now on {} — its previous world was saved to your vault as \"{}\"",
                 entry.name, realm.name, saved.name
+            ),
+            None if occupied => format!(
+                "\"{}\" is now on {} slot {slot}. Minecraft had no saved copy of what was there, so none could be kept.",
+                entry.name, realm.name
             ),
             None => format!("\"{}\" is now on {} slot {slot}", entry.name, realm.name),
         })
