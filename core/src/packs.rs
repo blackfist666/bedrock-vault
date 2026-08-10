@@ -27,6 +27,11 @@ pub struct Pack {
     pub uuid: String,
     pub name: String,
     pub version: String,
+    pub description: Option<String>,
+    /// `pack_icon.png` (or the template's `world_icon.jpeg`) as a data URI.
+    pub icon: Option<String>,
+    pub size_bytes: u64,
+    pub path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -107,8 +112,47 @@ fn read_pack(dir: &Path, category: &'static str) -> Result<Pack> {
     let uuid = header["uuid"].as_str().unwrap_or("?").to_owned();
     let raw_name = header["name"].as_str().unwrap_or("").to_owned();
     let name = resolve_name(dir, &raw_name);
-    let version = version_string(&header["version"]);
-    Ok(Pack { category, uuid, name, version })
+    let raw_description = header["description"].as_str().unwrap_or("").to_owned();
+    let description = Some(resolve_name(dir, &raw_description))
+        .filter(|d| !d.is_empty() && !looks_like_loc_key(d) && d != &name);
+    Ok(Pack {
+        category,
+        uuid,
+        name,
+        version: version_string(&header["version"]),
+        description,
+        icon: pack_icon(dir),
+        size_bytes: crate::scan::dir_size(dir),
+        path: dir.to_path_buf(),
+    })
+}
+
+/// The pack's own artwork, inlined for the UI.
+///
+/// Marketplace packs ship `pack_icon.png`; world templates additionally have
+/// the world's own `world_icon.jpeg`, which is the nicer picture of the two.
+fn pack_icon(dir: &Path) -> Option<String> {
+    use base64::Engine;
+
+    const MAX_BYTES: u64 = 512 * 1024;
+    for (file, mime) in [
+        ("world_icon.jpeg", "image/jpeg"),
+        ("pack_icon.png", "image/png"),
+        ("pack_icon.jpeg", "image/jpeg"),
+    ] {
+        let path = dir.join(file);
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if meta.len() == 0 || meta.len() > MAX_BYTES {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(&path) {
+            return Some(format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ));
+        }
+    }
+    None
 }
 
 /// Packs bundled inside a world template; unresolvable names fall back to the

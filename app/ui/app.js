@@ -5,10 +5,14 @@ const openDialog = window.__TAURI__.dialog.open;
 const state = {
   data: null,
   realms: null,
+  realmDetail: {},   // realm id -> slots/players, fetched on demand
+  packs: null,
+  packsLoading: false,
+  profile: null,
   section: "live",
   search: "",
   busy: false,
-  login: null,      // device code sign-in in progress
+  login: null,       // device code sign-in in progress
   loginTimer: null,
 };
 
@@ -16,7 +20,8 @@ const EXPLAIN = {
   live: "These are the worlds Minecraft can see right now. Put one away to tidy up the in-game list — it stays safe in the vault.",
   vault: "Every world you own lives here. Press Play to put one into Minecraft. Nothing here is lost when you tidy up your game.",
   backups: "Older copies of your worlds, kept automatically. If a world goes wrong, restore a copy from before it happened.",
-  realms: "Sign in with your Microsoft account to see your Realms.",
+  packs: "Everything from the Marketplace that is installed on this PC, and which of your worlds uses it.",
+  realms: "Your Realm and what is on it. Copy a Realm's world into your vault at any time.",
 };
 
 function humanSize(bytes) {
@@ -217,6 +222,142 @@ function backupRows() {
   });
 }
 
+/// A Realm shown in full: slots, what is on them, packs, players.
+function realmHero(realm) {
+  const card = el("div", "hero");
+
+  const head = el("div", "hero-head");
+  const title = el("div", "hero-title");
+  title.append(el("h2", null, realm.name));
+  const sub = el("div", "hero-sub");
+  sub.append(el("span", `chip ${realm.state === "OPEN" ? "mode" : ""}`, realm.state === "OPEN" ? "Open" : "Closed"));
+  sub.append(el("span", `chip ${realm.expired ? "warn" : "saved"}`, realm.subscription));
+  sub.append(el("span", "chip", `Up to ${realm.max_players ?? "?"} players`));
+  title.append(sub);
+  head.append(title);
+
+  const actions = el("div", "row-actions");
+  if (realm.can_download) {
+    actions.push = null;
+    actions.append(button("Copy world to vault", {
+      className: "green",
+      help: "Download this Realm's current world into your vault. Nothing on the Realm changes.",
+      onClick: () => confirmRun(
+        `Copy "${realm.name}" into your vault?`,
+        "The Realm's current world is downloaded and added to your vault as a new world. Nothing on the Realm itself is changed.",
+        "Yes, copy it", "realm_download",
+        { realmId: realm.id, slot: realm.active_slot, name: realm.name }),
+    }));
+  }
+  head.append(actions);
+  card.append(head);
+
+  const detail = state.realmDetail[realm.id];
+  if (!detail) {
+    card.append(el("div", "hero-loading", "Loading worlds…"));
+    loadRealmDetail(realm.id);
+    return card;
+  }
+  if (detail.error) {
+    card.append(el("div", "hero-loading", detail.error));
+    return card;
+  }
+
+  const slots = el("div", "slots");
+  for (const slot of detail.slots) {
+    const s = el("div", `slot ${slot.active ? "live" : ""}`);
+    const shead = el("div", "slot-head");
+    shead.append(el("span", "slot-num", `Slot ${slot.slot_id}`));
+    if (slot.active) shead.append(el("span", "chip live", "Playing now"));
+    s.append(shead);
+    s.append(el("div", "slot-name", slot.name));
+
+    const facts = el("div", "chips");
+    for (const t of [slot.game_mode, slot.difficulty, slot.hardcore ? "Hardcore" : null]) {
+      if (t) facts.append(el("span", "chip mode", t));
+    }
+    s.append(facts);
+
+    if (slot.packs.length) {
+      const packs = el("div", "slot-packs");
+      for (const p of slot.packs) {
+        const chipEl = el("div", `pack-chip ${p.installed ? "" : "warn"}`);
+        if (p.icon) {
+          const img = el("img", "pack-icon");
+          img.src = p.icon;
+          chipEl.append(img);
+        }
+        chipEl.append(el("span", null, p.name));
+        packs.append(chipEl);
+      }
+      s.append(packs);
+    }
+
+    if (slot.rules.length) {
+      s.append(el("div", "slot-rules",
+        slot.rules.map(([k, v]) => `${k}: ${v}`).join(" · ")));
+    }
+    if (slot.seed) s.append(el("div", "slot-rules", `Seed ${slot.seed}`));
+    slots.append(s);
+  }
+  card.append(slots);
+
+  if (detail.players && detail.players.length) {
+    const people = el("div", "players");
+    people.append(el("span", "players-label", "Players:"));
+    for (const p of detail.players) {
+      people.append(el("span", `chip ${p.online ? "saved" : ""}`,
+        `${p.name}${p.role ? ` (${p.role})` : ""}`));
+    }
+    card.append(people);
+  }
+  return card;
+}
+
+async function loadRealmDetail(id) {
+  if (state.realmDetail[id]) return;
+  state.realmDetail[id] = { loading: true };
+  try {
+    state.realmDetail[id] = await invoke("realm_detail", { realmId: id });
+  } catch (e) {
+    state.realmDetail[id] = { error: String(e) };
+  }
+  if (state.section === "realms") render();
+}
+
+function realmSummaryRow(realm) {
+  const actions = [];
+  if (realm.can_download) {
+    actions.push(button("Copy to vault", {
+      help: "Download this Realm's world into your vault.",
+      onClick: () => confirmRun(
+        `Copy "${realm.name}" into your vault?`,
+        "The Realm's world is downloaded and added to your vault. Nothing on the Realm is changed.",
+        "Yes, copy it", "realm_download",
+        { realmId: realm.id, slot: realm.active_slot, name: realm.name }),
+    }));
+  }
+  return worldRow({
+    icon: null,
+    name: realm.name,
+    chips: [
+      { text: realm.state === "OPEN" ? "Open" : "Closed", kind: realm.state === "OPEN" ? "mode" : "" },
+      { text: realm.subscription, kind: realm.expired ? "warn" : "saved" },
+      { text: realm.role === "yours" ? "Yours" : "Joined", kind: realm.role === "yours" ? "live" : "" },
+    ],
+    meta: `Slot ${realm.active_slot ?? "?"} · up to ${realm.max_players ?? "?"} players` +
+      (realm.can_download ? "" : " · only the owner can copy this world"),
+    actions,
+  });
+}
+
+function heading(text, note) {
+  const h = el("div", "section-head");
+  h.append(el("span", "section-title", text));
+  if (note) h.append(el("span", "section-note", note));
+  return h;
+}
+
 function realmRows() {
   const r = state.realms;
 
@@ -252,55 +393,104 @@ function realmRows() {
   }
 
   const rows = [];
-  const head = el("div", "row");
-  const headMain = el("div", "row-main");
-  headMain.append(el("div", "row-name", r.gamertag ? `Signed in as ${r.gamertag}` : "Signed in"));
-  headMain.append(el("div", "row-meta",
-    r.error ? r.error : `${r.realms.length} Realm${r.realms.length === 1 ? "" : "s"} on this account`));
-  head.append(headMain);
-  const headActions = el("div", "row-actions");
-  headActions.append(button("Refresh", { onClick: loadRealms }));
-  headActions.append(button("Sign out", {
-    onClick: () => confirmRun("Sign out?", "The saved sign-in is deleted from this PC. You can sign in again at any time.",
-      "Yes, sign out", "realms_sign_out", {}),
-  }));
-  head.append(headActions);
-  rows.push(head);
+  if (r.error) rows.push(el("div", "banner error", r.error));
 
-  for (const realm of r.realms.filter((x) => matches(x.name))) {
-    const actions = [];
-    if (realm.can_download) {
-      actions.push(button("Copy to vault", {
-        className: "green",
-        help: "Download this Realm's world into your vault. Nothing on the Realm is changed.",
-        onClick: () => confirmRun(
-          `Copy "${realm.name}" into your vault?`,
-          "The Realm's current world is downloaded and added to your vault as a new world. " +
-          "Nothing on the Realm itself is touched or changed.",
-          "Yes, copy it", "realm_download",
-          { realmId: realm.id, slot: realm.active_slot, name: realm.name }),
-      }));
-    }
+  const mine = r.mine.filter((x) => matches(x.name));
+  const expired = r.expired.filter((x) => matches(x.name));
+  const joined = r.joined.filter((x) => matches(x.name));
 
-    rows.push(worldRow({
-      icon: null,
-      name: realm.name,
-      chips: [
-        { text: realm.state === "OPEN" ? "Open" : "Closed", kind: realm.state === "OPEN" ? "mode" : "" },
-        { text: realm.subscription, kind: realm.expired ? "warn" : "saved" },
-        { text: realm.role === "yours" ? "Yours" : realm.role === "joined" ? "Joined" : "Owner unknown",
-          kind: realm.role === "yours" ? "live" : "" },
-      ],
-      meta: `Slot ${realm.active_slot ?? "?"} · up to ${realm.max_players ?? "?"} players` +
-        (realm.can_download ? "" : " · only the owner can copy this world"),
-      actions,
-    }));
+  // Your own live Realms get the whole treatment; everything else is a list.
+  if (mine.length) {
+    for (const realm of mine) rows.push(realmHero(realm));
+  } else if (!state.search) {
+    rows.push(el("div", "empty",
+      "You have no Realm running at the moment. Expired Realms are below — their worlds can still be copied into your vault."));
   }
 
-  if (!r.realms.length && !r.error) {
-    rows.push(el("div", "empty", "No Realms on this account."));
+  if (joined.length) {
+    rows.push(heading("Realms you have joined",
+      "Only a Realm's owner can copy or replace its world"));
+    for (const realm of joined) rows.push(realmSummaryRow(realm));
+  }
+
+  if (expired.length) {
+    rows.push(heading("Your past Realms",
+      "The subscriptions lapsed, but Minecraft still holds the worlds — copy them into your vault"));
+    for (const realm of expired) rows.push(realmSummaryRow(realm));
+  }
+
+  if (!mine.length && !joined.length && !expired.length) {
+    rows.push(el("div", "empty", state.search ? "No Realm matches that name." : "No Realms on this account."));
   }
   return rows;
+}
+
+function packRows() {
+  const p = state.packs;
+  if (!p) {
+    loadPacks();
+    return [el("div", "empty", "Reading your marketplace content…")];
+  }
+
+  const rows = [];
+  const shown = p.packs.filter((x) => matches(x.name));
+  let category = null;
+  for (const pack of shown) {
+    if (pack.category !== category) {
+      category = pack.category;
+      rows.push(heading(category, null));
+    }
+    const row = el("div", "row");
+    if (pack.icon) {
+      const img = el("img", "thumb pack");
+      img.src = pack.icon;
+      row.append(img);
+    } else {
+      row.append(el("div", "thumb pack placeholder", "📦"));
+    }
+
+    const main = el("div", "row-main");
+    main.append(el("div", "row-name", pack.name));
+    if (pack.description) main.append(el("div", "row-meta", pack.description));
+    const chips = el("div", "chips");
+    chips.append(el("span", "chip", `v${pack.version}`));
+    chips.append(el("span", "chip", humanSize(pack.size_bytes)));
+    if (pack.used_by.length) {
+      chips.append(el("span", "chip live", `Used by ${pack.used_by.join(", ")}`));
+    }
+    main.append(chips);
+    row.append(main);
+    rows.push(row);
+  }
+
+  if (!shown.length) {
+    rows.push(el("div", "empty",
+      state.search ? "No pack matches that name." : "No marketplace content is installed on this PC."));
+  }
+  if (p.persona_count && !state.search) {
+    rows.push(heading("Character creator",
+      `${p.persona_count} items owned — shown in game, not here`));
+  }
+  if (p.missing.length && !state.search) {
+    rows.push(heading("Not installed on this PC",
+      `${p.missing.length} add-on${p.missing.length > 1 ? "s are" : " is"} used by a world but not downloaded here`));
+  }
+  return rows;
+}
+
+async function loadPacks() {
+  if (state.packsLoading) return;
+  state.packsLoading = true;
+  try {
+    state.packs = await invoke("packs_overview");
+    const n = state.packs.packs.length;
+    document.getElementById("count-packs").textContent = `${n} item${n === 1 ? "" : "s"}`;
+    if (state.section === "packs") render();
+  } catch (e) {
+    banner(String(e), "error");
+  } finally {
+    state.packsLoading = false;
+  }
 }
 
 async function beginLogin() {
@@ -323,6 +513,7 @@ async function pollLogin() {
     stopLoginTimer();
     state.login = null;
     banner(`Signed in as ${who}`, "ok");
+    await loadProfile();
     await loadRealms();
     render();
   } catch (e) {
@@ -345,12 +536,47 @@ async function cancelLogin() {
   render();
 }
 
+/// The signed-in player, shown top-right on every page.
+function renderAccount() {
+  const box = document.getElementById("account");
+  const p = state.profile;
+  if (!p) {
+    box.className = "account hidden";
+    return;
+  }
+  box.className = "account";
+  const pic = document.getElementById("account-pic");
+  if (p.picture) {
+    pic.src = p.picture;
+    pic.style.display = "";
+  } else {
+    pic.style.display = "none";
+  }
+  document.getElementById("account-name").textContent = p.gamertag;
+  document.getElementById("account-sub").textContent =
+    p.gamerscore ? `${Number(p.gamerscore).toLocaleString()} gamerscore` : "Signed in";
+}
+
+async function loadProfile() {
+  try {
+    state.profile = await invoke("profile");
+  } catch {
+    state.profile = null;
+  }
+  renderAccount();
+}
+
 async function loadRealms() {
   try {
     state.realms = await invoke("realms_overview");
-    const n = state.realms.signed_in ? state.realms.realms.length : 0;
-    document.getElementById("count-realms").textContent =
-      state.realms.signed_in ? `${n} Realm${n === 1 ? "" : "s"}` : "not signed in";
+    state.realmDetail = {};
+    const r = state.realms;
+    const total = r.mine.length + r.expired.length + r.joined.length;
+    document.getElementById("count-realms").textContent = r.signed_in
+      ? (r.mine.length ? `${r.mine.length} active of ${total}` : `${total} Realm${total === 1 ? "" : "s"}`)
+      : "not signed in";
+    state.profile = r.profile || state.profile;
+    renderAccount();
   } catch (e) {
     banner(String(e), "error");
   }
@@ -361,12 +587,16 @@ function render() {
   grid.textContent = "";
   document.getElementById("explain").textContent = EXPLAIN[state.section];
 
-  const rows = { live: liveRows, vault: vaultRows, backups: backupRows, realms: realmRows }[state.section]();
+  const rows = {
+    live: liveRows, vault: vaultRows, backups: backupRows,
+    packs: packRows, realms: realmRows,
+  }[state.section]();
   if (!rows.length) {
     const empty = {
       live: "No worlds in Minecraft right now. Press Play on a vault world to add one.",
       vault: "The vault is empty. Save a world from Minecraft, or import a .mcworld file.",
       backups: "No backups yet. They are made automatically whenever a world is saved.",
+      packs: "No marketplace content is installed on this PC.",
       realms: "Nothing to show.",
     }[state.section];
     grid.append(el("div", "empty", state.search ? "Nothing matches that name." : empty));
@@ -389,8 +619,19 @@ function render() {
     main.textContent = "Open backups folder";
     main.disabled = state.busy;
     main.onclick = () => run("open_folder", { which: "backups" });
+  } else if (state.section === "packs") {
+    main.textContent = "Refresh";
+    main.disabled = state.busy;
+    main.onclick = () => { state.packs = null; loadPacks(); render(); };
+  } else if (state.realms && state.realms.signed_in && !state.login) {
+    main.textContent = "Sign out";
+    main.className = "mc-btn";
+    main.disabled = state.busy;
+    main.onclick = () => confirmRun("Sign out?",
+      "The saved sign-in is deleted from this PC. You can sign in again at any time.",
+      "Yes, sign out", "realms_sign_out", {});
   } else {
-    // Realms has its own buttons inside the panel.
+    // Signed out or mid sign-in: the panel carries its own buttons.
     main.style.display = "none";
   }
 }
@@ -424,9 +665,12 @@ async function run(cmd, args) {
     state.busy = false;
     showProgress("Refreshing…", 0, 0);
     if (cmd === "realms_sign_out") {
+      state.profile = null;
+      renderAccount();
       await loadRealms();
     } else {
       await load();
+      if (cmd === "realm_download") await loadRealms();
     }
     if (message) banner(message, "ok");
   } catch (e) {
@@ -496,6 +740,7 @@ document.querySelectorAll(".tab").forEach((tab) => {
     tab.classList.add("active");
     state.section = tab.dataset.section;
     if (state.section === "realms" && !state.realms) loadRealms().then(render);
+    if (state.section === "packs" && !state.packs) loadPacks();
     render();
   });
 });
@@ -557,5 +802,7 @@ setInterval(watchGame, 30000);
 window.addEventListener("focus", watchGame);
 
 load()
+  .then(loadProfile)
   .then(loadRealms)
+  .then(loadPacks)
   .catch((e) => banner(String(e), "error"));

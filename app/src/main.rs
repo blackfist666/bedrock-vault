@@ -493,12 +493,75 @@ struct RealmDto {
 }
 
 #[derive(Serialize)]
+struct SlotDto {
+    slot_id: i64,
+    name: String,
+    game_mode: Option<String>,
+    difficulty: Option<String>,
+    hardcore: bool,
+    seed: Option<String>,
+    active: bool,
+    /// Pack names where installed locally, otherwise a short id.
+    packs: Vec<PackRefDto>,
+    rules: Vec<[String; 2]>,
+}
+
+#[derive(Serialize)]
+struct PackRefDto {
+    name: String,
+    icon: Option<String>,
+    installed: bool,
+}
+
+#[derive(Serialize)]
+struct PlayerDto {
+    name: String,
+    role: Option<String>,
+    online: bool,
+    last_login: Option<i64>,
+}
+
+#[derive(Serialize)]
 struct RealmsDto {
     signed_in: bool,
-    gamertag: Option<String>,
-    realms: Vec<RealmDto>,
+    profile: Option<ProfileDto>,
+    /// Owned and still subscribed — the ones that can actually be managed.
+    mine: Vec<RealmDto>,
+    /// Owned but lapsed. Worlds are still downloadable.
+    expired: Vec<RealmDto>,
+    /// Someone else's Realm this account has joined.
+    joined: Vec<RealmDto>,
     /// Present when the account is signed in but the listing failed.
     error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ProfileDto {
+    gamertag: String,
+    picture: Option<String>,
+    gamerscore: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PackDto {
+    uuid: String,
+    name: String,
+    description: Option<String>,
+    version: String,
+    category: String,
+    icon: Option<String>,
+    size_bytes: u64,
+    /// Worlds in Minecraft or the vault that use this pack.
+    used_by: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PacksDto {
+    packs: Vec<PackDto>,
+    persona_count: usize,
+    total_bytes: u64,
+    /// Packs referenced by a world but not present on this PC.
+    missing: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -512,58 +575,228 @@ struct LoginDto {
 #[derive(Default)]
 struct PendingLogin(std::sync::Mutex<Option<realms::auth::DeviceLogin>>);
 
+fn profile_dto() -> Option<ProfileDto> {
+    realms::who_am_i().map(|p| ProfileDto {
+        gamertag: p.gamertag,
+        picture: p.picture,
+        gamerscore: p.gamerscore,
+    })
+}
+
+/// Who is signed in, for the window header. Cheap: served from the cache.
+#[tauri::command]
+async fn profile() -> Result<Option<ProfileDto>, String> {
+    blocking(|| Ok(profile_dto())).await
+}
+
 #[tauri::command]
 async fn realms_overview() -> Result<RealmsDto, String> {
     blocking(|| {
+        let empty = |error: Option<String>, signed_in: bool| RealmsDto {
+            signed_in,
+            profile: if signed_in { profile_dto() } else { None },
+            mine: Vec::new(),
+            expired: Vec::new(),
+            joined: Vec::new(),
+            error,
+        };
         if !realms::cache::is_signed_in() {
-            return Ok(RealmsDto {
-                signed_in: false,
-                gamertag: None,
-                realms: Vec::new(),
-                error: None,
-            });
+            return Ok(empty(None, false));
         }
+        // Signed in but the token could not be renewed: say so rather than
+        // silently showing an empty list.
         let session = match realms::session(false) {
             Ok(s) => s,
-            // Signed in but the token could not be renewed: report it rather
-            // than silently showing an empty list.
-            Err(e) => {
-                return Ok(RealmsDto {
-                    signed_in: true,
-                    gamertag: None,
-                    realms: Vec::new(),
-                    error: Some(format!("{e:#}")),
-                })
-            }
+            Err(e) => return Ok(empty(Some(format!("{e:#}")), true)),
         };
-        let gamertag = session.gamertag.clone();
-        match realms::list(&session) {
-            Ok(list) => Ok(RealmsDto {
-                signed_in: true,
-                gamertag,
-                realms: list
-                    .into_iter()
-                    .map(|r| RealmDto {
-                        subscription: r.subscription(),
-                        role: r.role(),
-                        can_download: r.owner == Some(true),
-                        id: r.id,
-                        name: r.name,
-                        state: r.state,
-                        expired: r.expired,
-                        active_slot: r.active_slot,
-                        max_players: r.max_players,
+
+        let list = match realms::list(&session) {
+            Ok(list) => list,
+            Err(e) => return Ok(empty(Some(format!("{e:#}")), true)),
+        };
+
+        let to_dto = |r: realms::Realm| RealmDto {
+            subscription: r.subscription(),
+            role: r.role(),
+            can_download: r.owner == Some(true),
+            id: r.id,
+            name: r.name,
+            state: r.state,
+            expired: r.expired,
+            active_slot: r.active_slot,
+            max_players: r.max_players,
+        };
+
+        let mut dto = empty(None, true);
+        for realm in list {
+            let owned = realm.owner == Some(true);
+            match (owned, realm.expired) {
+                (true, false) => dto.mine.push(to_dto(realm)),
+                (true, true) => dto.expired.push(to_dto(realm)),
+                (false, _) => dto.joined.push(to_dto(realm)),
+            }
+        }
+        Ok(dto)
+    })
+    .await
+}
+
+/// Everything about one Realm: slots, worlds, packs and players.
+#[tauri::command]
+async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
+        let detail = realms::detail(&session, realm_id).map_err(|e| format!("{e:#}"))?;
+        let installed = installed_packs();
+
+        let slots: Vec<SlotDto> = detail
+            .slots
+            .into_iter()
+            .map(|s| SlotDto {
+                name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
+                packs: s
+                    .pack_ids
+                    .iter()
+                    .map(|id| match installed.get(&id.replace('-', "")) {
+                        Some(p) => PackRefDto {
+                            name: p.0.clone(),
+                            icon: p.1.clone(),
+                            installed: true,
+                        },
+                        None => PackRefDto {
+                            name: "Add-on not installed on this PC".to_owned(),
+                            icon: None,
+                            installed: false,
+                        },
                     })
                     .collect(),
-                error: None,
-            }),
-            Err(e) => Ok(RealmsDto {
-                signed_in: true,
-                gamertag,
-                realms: Vec::new(),
-                error: Some(format!("{e:#}")),
-            }),
+                rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
+                slot_id: s.slot_id,
+                game_mode: s.game_mode,
+                difficulty: s.difficulty,
+                hardcore: s.hardcore,
+                seed: s.seed,
+                active: s.active,
+            })
+            .collect();
+
+        let players: Vec<PlayerDto> = detail
+            .players
+            .into_iter()
+            .map(|p| PlayerDto {
+                name: p.name.unwrap_or_else(|| "Player".into()),
+                role: p.role,
+                online: p.online,
+                last_login: p.last_login,
+            })
+            .collect();
+
+        serde_json::to_value(serde_json::json!({
+            "id": detail.realm.id,
+            "name": detail.realm.name,
+            "state": detail.realm.state,
+            "subscription": detail.realm.subscription(),
+            "expired": detail.realm.expired,
+            "max_players": detail.realm.max_players,
+            "slots": slots,
+            "players": players,
+            "product": detail.product,
+        }))
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// uuid (dashless) -> (name, icon) for everything installed from the store.
+fn installed_packs() -> HashMap<String, (String, Option<String>)> {
+    let mut index = HashMap::new();
+    for (_, cache) in packs::find_premium_caches() {
+        if let Ok((found, _)) = packs::scan_premium_cache(&cache) {
+            for p in found {
+                index.insert(p.uuid.replace('-', ""), (p.name, p.icon));
+            }
         }
+    }
+    index
+}
+
+/// Marketplace content installed on this PC, with what uses it.
+#[tauri::command]
+async fn packs_overview() -> Result<PacksDto, String> {
+    blocking(|| {
+        // Which worlds use which pack, so a pack can say where it is in use.
+        let mut used_by: HashMap<String, Vec<String>> = HashMap::new();
+        let mut referenced: Vec<String> = Vec::new();
+
+        let mut note = |dir: &std::path::Path, world: &str| {
+            let (rp, bp) = packs::world_pack_refs(dir);
+            for r in rp.into_iter().chain(bp) {
+                let key = r.uuid.replace('-', "");
+                referenced.push(key.clone());
+                let entry = used_by.entry(key).or_default();
+                if !entry.iter().any(|w| w == world) {
+                    entry.push(world.to_owned());
+                }
+            }
+        };
+
+        if let Ok(locations) = scan::find_worlds_dirs() {
+            for loc in locations.iter().filter(|l| l.path.is_dir()) {
+                if let Ok(worlds) = scan::scan(&loc.path) {
+                    for w in worlds {
+                        note(&loc.path.join(&w.folder), &w.display_name());
+                    }
+                }
+            }
+        }
+        if let Ok(vault) = open_vault() {
+            for e in vault.list().unwrap_or_default() {
+                note(&e.world_dir, &e.name);
+            }
+        }
+
+        let mut all = Vec::new();
+        let mut persona_count = 0;
+        let mut installed_ids = std::collections::HashSet::new();
+        for (_, cache) in packs::find_premium_caches() {
+            if let Ok((found, persona)) = packs::scan_premium_cache(&cache) {
+                persona_count += persona;
+                for p in found {
+                    let key = p.uuid.replace('-', "");
+                    installed_ids.insert(key.clone());
+                    all.push(PackDto {
+                        used_by: used_by.get(&key).cloned().unwrap_or_default(),
+                        category: packs::CATEGORIES
+                            .iter()
+                            .find(|(dir, _)| *dir == p.category)
+                            .map(|(_, title)| (*title).to_owned())
+                            .unwrap_or_else(|| "Add-on".to_owned()),
+                        uuid: p.uuid,
+                        name: p.name,
+                        description: p.description,
+                        version: p.version,
+                        icon: p.icon,
+                        size_bytes: p.size_bytes,
+                    });
+                }
+            }
+        }
+        // Templates bundle copies of their own packs; show the template only.
+        all.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+
+        let mut missing: Vec<String> = referenced
+            .into_iter()
+            .filter(|id| !installed_ids.contains(id))
+            .collect();
+        missing.sort();
+        missing.dedup();
+
+        Ok(PacksDto {
+            total_bytes: all.iter().map(|p| p.size_bytes).sum(),
+            packs: all,
+            persona_count,
+            missing,
+        })
     })
     .await
 }
@@ -754,7 +987,7 @@ fn main() {
             overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
             restore, import, export, open_folder, set_vault_location, realms_overview,
             realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out,
-            realm_download, open_url
+            realm_download, realm_detail, packs_overview, profile, open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");

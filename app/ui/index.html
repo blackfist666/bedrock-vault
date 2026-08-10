@@ -8,7 +8,16 @@
   <body>
     <header>
       <div class="brand">BEDROCK VAULT</div>
-      <div id="status" class="status"></div>
+      <div class="header-right">
+        <div id="status" class="status"></div>
+        <div id="account" class="account hidden">
+          <img id="account-pic" class="account-pic" alt="" />
+          <div class="account-text">
+            <span id="account-name" class="account-name"></span>
+            <span id="account-sub" class="account-sub"></span>
+          </div>
+        </div>
+      </div>
     </header>
 
     <nav class="tabs">
@@ -23,6 +32,10 @@
       <button class="tab" data-section="backups">
         <span class="tab-icon">🕘</span>
         <span class="tab-text"><span class="tab-name">Backups</span><span class="tab-sub" id="count-backups"></span></span>
+      </button>
+      <button class="tab" data-section="packs">
+        <span class="tab-icon">📦</span>
+        <span class="tab-text"><span class="tab-name">Packs</span><span class="tab-sub" id="count-packs"></span></span>
       </button>
       <button class="tab" data-section="realms">
         <span class="tab-icon">🌐</span>
