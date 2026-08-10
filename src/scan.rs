@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 
 use crate::level_dat::{self, WorldMeta};
 
-const PACKAGE_IDS: &[&str] = &[
+pub const PACKAGE_IDS: &[&str] = &[
     "Microsoft.MinecraftUWP_8wekyb3d8bbwe",        // release
     "Microsoft.MinecraftWindowsBeta_8wekyb3d8bbwe", // preview
 ];

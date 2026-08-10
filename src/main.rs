@@ -1,6 +1,7 @@
 mod level_dat;
 mod mcworld;
 mod nbt;
+mod packs;
 mod scan;
 
 use std::path::PathBuf;
@@ -24,6 +25,8 @@ enum Cmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// List installed store/marketplace content and per-world pack usage
+    Packs,
     /// Pack a world folder into a .mcworld
     Pack { world_dir: PathBuf, out: PathBuf },
     /// Unpack a .mcworld into a new folder and validate it
@@ -33,6 +36,7 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Scan { dir } => cmd_scan(dir),
+        Cmd::Packs => cmd_packs(),
         Cmd::Pack { world_dir, out } => {
             let files = mcworld::pack(&world_dir, &out)?;
             println!(
@@ -108,6 +112,67 @@ fn cmd_scan(dir: Option<PathBuf>) -> Result<()> {
         grand_size += size;
     }
     println!("Total: {} world(s), {}", grand_count, human_size(grand_size));
+    Ok(())
+}
+
+fn cmd_packs() -> Result<()> {
+    let caches = packs::find_premium_caches();
+    if caches.is_empty() {
+        println!("No premium_cache found — no store content has been downloaded on this machine.");
+    }
+
+    // uuid -> name, across all caches, for the per-world join below.
+    let mut index: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for (label, cache) in &caches {
+        println!("[{label}] {}\n", cache.display());
+        let (all, persona_count) = packs::scan_premium_cache(cache)?;
+        for (dir_name, title) in packs::CATEGORIES {
+            let of_kind: Vec<_> = all.iter().filter(|p| p.category == *dir_name).collect();
+            if of_kind.is_empty() {
+                continue;
+            }
+            println!("{} ({})", title.to_uppercase(), of_kind.len());
+            for p in &of_kind {
+                println!("  {:<44} {:<10} {}", truncate(&p.name, 44), p.version, p.uuid);
+            }
+            println!();
+        }
+        if persona_count > 0 {
+            println!("Persona items: {persona_count} (character creator cosmetics)\n");
+        }
+        for p in all {
+            index.insert(p.uuid.clone(), p.name);
+        }
+    }
+
+    println!("WORLD PACK USAGE");
+    let mut any = false;
+    for loc in scan::find_worlds_dirs()? {
+        if !loc.path.is_dir() {
+            continue;
+        }
+        for world in scan::scan(&loc.path)? {
+            let world_dir = loc.path.join(&world.folder);
+            let (rp, bp) = packs::world_pack_refs(&world_dir);
+            if rp.is_empty() && bp.is_empty() {
+                continue;
+            }
+            any = true;
+            println!("  {} [{}]", world.display_name(), loc.label);
+            for (kind, refs) in [("resource", rp), ("behavior", bp)] {
+                for r in refs {
+                    match index.get(&r.uuid) {
+                        Some(name) => println!("    {kind}: {name} ({})", r.version),
+                        None => println!("    {kind}: {} ({}) — not in premium_cache", r.uuid, r.version),
+                    }
+                }
+            }
+        }
+    }
+    if !any {
+        println!("  (no world references any pack)");
+    }
     Ok(())
 }
 

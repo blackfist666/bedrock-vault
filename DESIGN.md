@@ -37,6 +37,11 @@ Minecraft Bedrock Realms provides only **3 world slots**, and the in-game world 
 
 ### 4.1 Local worlds
 
+Two storage layouts exist, and the app must support both (verified on a live install 2026-08-10):
+
+- **GDK (current, new launcher):** `%appdata%\Minecraft Bedrock\Users\<xuid-or-Shared>\games\com.mojang\minecraftWorlds\` — one `Users\<id>` tree per signed-in profile plus a `Shared` tree
+- **UWP (legacy Store package):** the path below; may be a **junction** to another drive (e.g. `F:\WpSystem\...`) if the app was moved in Windows settings
+
 ```
 %localappdata%\Packages\Microsoft.MinecraftUWP_8wekyb3d8bbwe\LocalState\games\com.mojang\minecraftWorlds\<random-id>\
 ├── level.dat          # little-endian NBT, 8-byte header (version + payload length)
@@ -53,6 +58,26 @@ Key facts:
 - Useful `level.dat` fields: `LevelName`, `RandomSeed`, `GameType`, `LastPlayed` (unix), `lastOpenedWithVersion` (int list), `Difficulty`, experiments flags
 - A `.mcworld` file is a **zip of the world folder contents** (not the folder itself — `level.dat` must be at the zip root)
 - The `db/` LevelDB is fragile: copying while Minecraft holds it open produces corrupt worlds
+
+### 4.1a Marketplace content
+
+Downloaded store content lives outside the worlds, in `premium_cache` (GDK: `%appdata%\Minecraft Bedrock\premium_cache\`; UWP: `LocalState\premium_cache\`):
+
+```
+premium_cache\
+├── world_templates\<id>\     # full world + manifest.json + embedded resource_packs/ & behavior_packs/
+├── resource_packs\<id>\      # manifest.json (readable), texts\*.lang, pack_icon.png
+├── behavior_packs\<id>\
+├── skin_packs\<id>\
+└── persona\<id>\             # character-creator cosmetics
+```
+
+Key facts:
+
+- Every pack has a readable `manifest.json` (`header.uuid`, `header.version`); the display name is usually a localization key (`pack.name`, or `skinpack.<Id>` for skin packs) resolved from `texts\<locale>.lang`
+- Worlds list the packs they use by uuid in `world_resource_packs.json` / `world_behavior_packs.json` (older worlds store the version as the string `"[1,0,55]"` rather than an array)
+- Worlds created from a template reference the template's **embedded** pack uuids, not the template uuid itself
+- `premium_cache` only holds **downloaded** content; a complete "everything owned" list requires the marketplace entitlements API (Tier 2 territory)
 
 ### 4.2 Realms
 
@@ -156,6 +181,8 @@ realm_slots (                     -- Tier 2 cache
 | T1-8 | **Process guard** | Refuse any world-folder operation while `Minecraft.Windows.exe` is running; poll + clear UI banner |
 | T1-9 | **Realm staging folder** | One-click "Stage for Realm": export selected world as `.mcworld` into `exports\` and open Explorer there — the manual bridge until Tier 2 |
 | T1-10 | **Duplicate/rename** | Duplicate world in library; rename updates `LevelName` in `level.dat` + `levelname.txt` |
+| T1-11 | **Pack inventory** | List installed marketplace content from `premium_cache` (templates, addons, skin packs; persona as a count) with names resolved from `.lang` files |
+| T1-12 | **World ↔ pack mapping** | Show which packs each world uses (join `world_*_packs.json` uuids against the inventory, including template-embedded packs); flag references to content not present on this machine |
 
 ### 6.2 Key implementation details
 
@@ -181,6 +208,7 @@ Realm API calls, auth, cloud anything. Tier 1 ships as a fully offline tool.
 | T2-4 | **Upload library → slot** | Pack `.mcworld`, close Realm, request upload URL, upload, reopen Realm; auto-backup the current slot world first (T2-3) |
 | T2-5 | **Realm backup browser** | List Mojang-side backups per slot; download any into the library |
 | T2-6 | **Slot → vault mapping** | Track which vault world was last pushed to each slot (`realm_slots` table); surface "slot has drifted" when Realm play has diverged from the vault copy |
+| T2-7 | **Owned-content list** | Full marketplace entitlements (including never-downloaded purchases) via the signed-in account, complementing the local T1-11 inventory |
 
 ### 7.2 Sidecar protocol
 
@@ -228,7 +256,7 @@ Sidecar is stateless beyond the auth token cache; all orchestration (backup-firs
 - **OQ1:** Copy vs move as the default activate strategy (copy = safer, 2× disk for active worlds)
 - **OQ2:** Watch `minecraftWorlds` with a filesystem watcher for live re-index, or rescan on focus? (Watcher preferred; needs debounce while MC is saving)
 - **OQ3:** Minigame slot support in Tier 2, or standard slots 1–3 only?
-- **OQ4:** GDK/preview builds of Minecraft use a different package path — support both `Microsoft.MinecraftUWP` and `Microsoft.MinecraftWindowsBeta` package ids?
+- ~~**OQ4:** GDK/preview builds of Minecraft use a different package path — support both `Microsoft.MinecraftUWP` and `Microsoft.MinecraftWindowsBeta` package ids?~~ **Resolved:** GDK (`%appdata%\Minecraft Bedrock`) is the primary layout on current installs; the scanner supports GDK profiles + both UWP package ids (§4.1)
 - **OQ5:** Store library worlds unzipped (fast activate) vs zipped (half the disk) — current design says unzipped; revisit if vault size becomes a complaint
 
 ## 11. Licensing & Attribution
