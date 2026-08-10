@@ -1,0 +1,17 @@
+[package]
+name = "bedrock-vault"
+version = "0.0.1"
+edition = "2021"
+description = "Bedrock Vault M0 spike: scan minecraftWorlds, pack/unpack .mcworld"
+license = "MIT"
+
+[[bin]]
+name = "vault"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+zip = "2"

@@ -1,0 +1,133 @@
+mod level_dat;
+mod mcworld;
+mod nbt;
+mod scan;
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use chrono::{Local, TimeZone};
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "vault", version, about = "Bedrock Vault M0 spike")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Scan minecraftWorlds and print a metadata table
+    Scan {
+        /// Directory to scan instead of the live minecraftWorlds
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Pack a world folder into a .mcworld
+    Pack { world_dir: PathBuf, out: PathBuf },
+    /// Unpack a .mcworld into a new folder and validate it
+    Unpack { mcworld: PathBuf, dest: PathBuf },
+}
+
+fn main() -> Result<()> {
+    match Cli::parse().cmd {
+        Cmd::Scan { dir } => cmd_scan(dir),
+        Cmd::Pack { world_dir, out } => {
+            let files = mcworld::pack(&world_dir, &out)?;
+            println!(
+                "Packed {} file(s) from {} into {} ({})",
+                files,
+                world_dir.display(),
+                out.display(),
+                human_size(std::fs::metadata(&out)?.len())
+            );
+            Ok(())
+        }
+        Cmd::Unpack { mcworld, dest } => {
+            let files = mcworld::unpack(&mcworld, &dest)?;
+            let meta = level_dat::parse(&std::fs::read(dest.join("level.dat"))?)?;
+            println!(
+                "Unpacked {} file(s) into {} — \"{}\" v{} ({})",
+                files,
+                dest.display(),
+                meta.name.as_deref().unwrap_or("<unnamed>"),
+                meta.version.as_deref().unwrap_or("?"),
+                meta.game_mode_label(),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn cmd_scan(dir: Option<PathBuf>) -> Result<()> {
+    let dir = match dir {
+        Some(d) => d,
+        None => scan::find_worlds_dir()?,
+    };
+    println!("Scanning {}\n", dir.display());
+    if !dir.is_dir() {
+        println!("Directory does not exist yet — the game creates it with the first local world.");
+        println!("0 worlds.");
+        return Ok(());
+    }
+    let worlds = scan::scan(&dir)?;
+
+    println!(
+        "{:<14} {:<28} {:<9} {:<12} {:<16} {:>9}  {:<20}",
+        "FOLDER", "NAME", "MODE", "VERSION", "LAST PLAYED", "SIZE", "SEED"
+    );
+    for w in &worlds {
+        match &w.meta {
+            Ok(m) => println!(
+                "{:<14} {:<28} {:<9} {:<12} {:<16} {:>9}  {:<20}",
+                truncate(&w.folder, 14),
+                truncate(&w.display_name(), 28),
+                m.game_mode_label(),
+                m.version.as_deref().unwrap_or("-"),
+                m.last_played.map(fmt_time).unwrap_or_else(|| "-".into()),
+                human_size(w.size_bytes),
+                m.seed.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            ),
+            Err(e) => println!(
+                "{:<14} {:<28} !! level.dat unreadable: {e:#}",
+                truncate(&w.folder, 14),
+                truncate(&w.display_name(), 28),
+            ),
+        }
+    }
+    let total: u64 = worlds.iter().map(|w| w.size_bytes).sum();
+    println!("\n{} world(s), {} total", worlds.len(), human_size(total));
+    Ok(())
+}
+
+fn fmt_time(unix: i64) -> String {
+    match Local.timestamp_opt(unix, 0) {
+        chrono::LocalResult::Single(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        _ => format!("@{unix}"),
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max - 1).collect();
+        format!("{cut}…")
+    }
+}
