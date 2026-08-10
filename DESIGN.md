@@ -226,7 +226,8 @@ Tokens are cached in `%APPDATA%\BedrockVault\auth.json`, never logged — error 
 
 **Observed API quirks** (verified against a live account, 8 Realms):
 
-- `owner` is always an empty string on `/worlds`; **`member`** is what distinguishes a Realm you own (`false`) from one you joined (`true`)
+- `owner` is always an empty string on `/worlds`, and **`member` is false even for Realms the account merely joined** — neither field indicates ownership. The only reliable test is `ownerUUID` against the signed-in account's own XUID, and where that is unknown the app says so rather than guessing (only an owner may replace a Realm's world)
+- The Realms relying party's XSTS response carries **only** `uhs` — no gamertag, no XUID. Identity needs a second XSTS authorisation of the same Xbox user token against `http://xboxlive.com`
 - `players` is `null` unless populated; `slots` is `null` on this endpoint
 - `daysLeft` goes negative for expired Realms, and `expired` is not always set alongside it
 

@@ -30,6 +30,9 @@ const XBL_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
 const XSTS_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 /// The Realms service is the relying party the XSTS token must be scoped to.
 pub const REALMS_RELYING_PARTY: &str = "https://pocket.realms.minecraft.net/";
+/// General Xbox Live. Needed only for identity: the Realms relying party
+/// returns nothing but a user hash, so the gamertag and XUID come from here.
+const XBOX_LIVE_RELYING_PARTY: &str = "http://xboxlive.com";
 
 /// What the user must do to finish signing in.
 #[derive(Debug, Clone)]
@@ -59,6 +62,15 @@ pub struct XstsToken {
     pub user_hash: String,
     /// Gamertag, when Xbox supplies one.
     pub gamertag: Option<String>,
+    /// The signed-in account's XUID.
+    ///
+    /// The only reliable way to tell a Realm you own from one you merely
+    /// joined: compare this against the listing's `ownerUUID`.
+    pub xuid: Option<String>,
+    /// Everything Xbox returned about the account, kept for diagnosing an
+    /// unofficial API whose claim names have changed before.
+    #[serde(default)]
+    pub claims: Option<serde_json::Value>,
     pub expires_at: i64,
 }
 
@@ -179,13 +191,18 @@ fn xbox_user_token(access_token: &str) -> Result<String> {
 
 /// Authorise an XBL user token for the Realms service.
 pub fn xsts_for_realms(user_token: &str) -> Result<XstsToken> {
+    xsts_for(user_token, REALMS_RELYING_PARTY)
+}
+
+/// Authorise an XBL user token for one relying party.
+fn xsts_for(user_token: &str, relying_party: &str) -> Result<XstsToken> {
     let response = ureq::post(XSTS_URL)
         .set("Content-Type", "application/json")
         .set("Accept", "application/json")
         .set("x-xbl-contract-version", "1")
         .send_json(serde_json::json!({
             "Properties": { "SandboxId": "RETAIL", "UserTokens": [user_token] },
-            "RelyingParty": REALMS_RELYING_PARTY,
+            "RelyingParty": relying_party,
             "TokenType": "JWT",
         }));
 
@@ -213,7 +230,9 @@ pub fn xsts_for_realms(user_token: &str) -> Result<XstsToken> {
             .as_str()
             .context("Xbox did not return a user hash")?
             .to_owned(),
-        gamertag: claims["gtg"].as_str().map(str::to_owned),
+        gamertag: claims["gtg"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+        xuid: claims["xid"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+        claims: Some(claims.clone()),
         // Xbox returns an ISO timestamp; fall back to a conservative window.
         expires_at: body["NotAfter"]
             .as_str()
@@ -223,9 +242,22 @@ pub fn xsts_for_realms(user_token: &str) -> Result<XstsToken> {
 }
 
 /// Full chain: Microsoft access token to a Realms-ready XSTS token.
+///
+/// Two authorisations from the same Xbox user token: one for Realms (the API
+/// credential) and one for Xbox Live (identity). The Realms relying party
+/// returns only a user hash, so without the second call there is no XUID — and
+/// without an XUID, an owned Realm cannot be told from a joined one.
 pub fn realms_session(access_token: &str) -> Result<XstsToken> {
     let user_token = xbox_user_token(access_token)?;
-    xsts_for_realms(&user_token)
+    let mut token = xsts_for(&user_token, REALMS_RELYING_PARTY)?;
+
+    // Best effort: failing to learn the gamertag must not block Realms access.
+    if let Ok(identity) = xsts_for(&user_token, XBOX_LIVE_RELYING_PARTY) {
+        token.gamertag = identity.gamertag;
+        token.xuid = identity.xuid;
+        token.claims = identity.claims;
+    }
+    Ok(token)
 }
 
 /// How long to wait between polls.
@@ -298,6 +330,8 @@ mod tests {
             token: "eyJhbGciOi".into(),
             user_hash: "1234567890".into(),
             gamertag: Some("Someone".into()),
+            xuid: Some("0000000000000000".into()),
+            claims: None,
             expires_at: now() + 3600,
         };
         assert_eq!(token.authorization(), "XBL3.0 x=1234567890;eyJhbGciOi");
@@ -310,6 +344,8 @@ mod tests {
             token: "t".into(),
             user_hash: "h".into(),
             gamertag: None,
+            xuid: None,
+            claims: None,
             // Inside the 60s margin, so it must already count as expired.
             expires_at: now() + 30,
         };

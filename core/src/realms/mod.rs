@@ -30,8 +30,14 @@ pub struct Realm {
     pub motd: String,
     /// `OPEN`, `CLOSED`, or whatever the service reports.
     pub state: String,
-    /// True when the signed-in account owns it rather than having joined it.
-    pub owner: bool,
+    /// Whether the signed-in account owns this Realm.
+    ///
+    /// `None` when it cannot be determined, which is deliberately distinct from
+    /// "not yours": guessing wrong here would mislead about what can be
+    /// uploaded, since only an owner may replace a Realm's world.
+    pub owner: Option<bool>,
+    /// XUID of the Realm's owner.
+    pub owner_uuid: String,
     pub expired: bool,
     pub days_left: Option<i64>,
     /// Which of the Realm's slots is live, when reported.
@@ -41,6 +47,15 @@ pub struct Realm {
 }
 
 impl Realm {
+    /// What this account may do here, in words.
+    pub fn role(&self) -> &'static str {
+        match self.owner {
+            Some(true) => "yours",
+            Some(false) => "joined",
+            None => "?",
+        }
+    }
+
     /// How long is left, in words.
     pub fn subscription(&self) -> String {
         match (self.expired, self.days_left) {
@@ -91,19 +106,33 @@ pub fn list(session: &auth::XstsToken) -> Result<Vec<Realm>> {
     let servers = body["servers"]
         .as_array()
         .context("the Realms service did not return a server list")?;
-    Ok(servers.iter().map(realm_from).collect())
+    Ok(servers
+        .iter()
+        .map(|v| realm_from_as(v, session.xuid.as_deref()))
+        .collect())
 }
 
+#[cfg(test)]
 fn realm_from(v: &serde_json::Value) -> Realm {
+    realm_from_as(v, None)
+}
+
+/// Parse one Realm, deciding ownership by comparing against `my_xuid`.
+fn realm_from_as(v: &serde_json::Value, my_xuid: Option<&str>) -> Realm {
     Realm {
         id: v["id"].as_i64().unwrap_or_default(),
         name: v["name"].as_str().unwrap_or("<unnamed>").to_owned(),
         motd: v["motd"].as_str().unwrap_or_default().to_owned(),
         state: v["state"].as_str().unwrap_or("UNKNOWN").to_owned(),
-        // The service reports membership, not ownership: `member` is true for a
-        // Realm you joined, false for one you own. `owner` is always empty on
-        // this endpoint, so it cannot be used to tell them apart.
-        owner: !v["member"].as_bool().unwrap_or(false),
+        // Ownership is `ownerUUID` against our own XUID, and nothing else.
+        // `owner` is always empty on this endpoint, and `member` came back
+        // false even for Realms the account had merely joined — an earlier
+        // reading of `member` claimed every Realm was owned, which was wrong.
+        owner: match (my_xuid, v["ownerUUID"].as_str()) {
+            (Some(mine), Some(theirs)) if !theirs.is_empty() => Some(mine == theirs),
+            _ => None,
+        },
+        owner_uuid: v["ownerUUID"].as_str().unwrap_or_default().to_owned(),
         expired: v["expired"].as_bool().unwrap_or(false),
         days_left: v["daysLeft"].as_i64(),
         active_slot: v["activeSlot"].as_i64(),
@@ -175,21 +204,39 @@ mod tests {
             "member": false, "expired": false, "daysLeft": 22, "activeSlot": 3,
             "players": null, "maxPlayers": 10, "tier": "TEN_PLAYERS"
         });
-        let realm = realm_from(&body);
+        let realm = realm_from_as(&body, Some("0000000000000000"));
         assert_eq!(realm.id, 12345);
         assert_eq!(realm.name, "Example Realm");
         assert_eq!(realm.state, "OPEN");
         assert_eq!(realm.days_left, Some(22));
         assert_eq!(realm.active_slot, Some(3));
         assert_eq!(realm.player_count, None, "players is null unless populated");
-        assert!(realm.owner, "member=false means this account owns it");
+        assert_eq!(realm.owner, Some(true), "ownerUUID matches our XUID");
         assert_eq!(realm.subscription(), "22 days left");
     }
 
+    /// The bug this replaced: `member` was false even for Realms the account
+    /// had only joined, so reading it marked every Realm as owned.
     #[test]
-    fn a_joined_realm_is_not_owned() {
-        let realm = realm_from(&serde_json::json!({ "member": true, "name": "Someone Else's" }));
-        assert!(!realm.owner);
+    fn a_joined_realm_is_not_owned_even_when_member_is_false() {
+        let body = serde_json::json!({
+            "name": "Someone Else's", "ownerUUID": "1111111111111111", "member": false
+        });
+        let realm = realm_from_as(&body, Some("0000000000000000"));
+        assert_eq!(realm.owner, Some(false));
+        assert_eq!(realm.role(), "joined");
+    }
+
+    #[test]
+    fn ownership_is_unknown_rather_than_guessed() {
+        let body = serde_json::json!({ "name": "Any", "ownerUUID": "1111111111111111" });
+        // No XUID for the signed-in account: must not claim either way, since
+        // only an owner may replace a Realm's world.
+        assert_eq!(realm_from_as(&body, None).owner, None);
+        assert_eq!(realm_from_as(&body, None).role(), "?");
+        // Owner not reported by the service either.
+        let blank = serde_json::json!({ "name": "Any", "ownerUUID": "" });
+        assert_eq!(realm_from_as(&blank, Some("0000000000000000")).owner, None);
     }
 
     #[test]
@@ -206,7 +253,6 @@ mod tests {
         let realm = realm_from(&serde_json::json!({}));
         assert_eq!(realm.name, "<unnamed>");
         assert_eq!(realm.state, "UNKNOWN");
-        // Absent `member` must not claim someone else's Realm is unowned.
-        assert!(realm.owner);
+        assert_eq!(realm.owner, None);
     }
 }

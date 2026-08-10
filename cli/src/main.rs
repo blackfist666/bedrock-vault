@@ -34,6 +34,15 @@ enum Cmd {
     Login,
     /// Forget the signed-in Microsoft account
     Logout,
+    /// Show the signed-in account
+    Account {
+        /// Re-authorise with Xbox even if the saved token is still valid
+        #[arg(long)]
+        refresh: bool,
+        /// Print the claims Xbox returned about the account
+        #[arg(long)]
+        raw: bool,
+    },
     /// List the Realms this account can see
     Realms {
         /// Print the service's raw JSON — the API is unofficial, so this is how
@@ -111,6 +120,7 @@ fn main() -> Result<()> {
             println!("Signed out — the saved tokens have been deleted.");
             Ok(())
         }
+        Cmd::Account { refresh, raw } => cmd_account(refresh, raw),
         Cmd::Realms { raw } => cmd_realms(raw),
         Cmd::Where => {
             let root = vault_root.clone().unwrap_or_else(config::vault_root);
@@ -254,6 +264,10 @@ fn cmd_login() -> Result<()> {
 
 /// The signed-in session, refreshed if the Realms token has aged out.
 fn realms_session() -> Result<realms::auth::XstsToken> {
+    session_with_refresh(false)
+}
+
+fn session_with_refresh(force: bool) -> Result<realms::auth::XstsToken> {
     let mut session = realms::cache::load();
     let microsoft = session
         .microsoft
@@ -261,7 +275,9 @@ fn realms_session() -> Result<realms::auth::XstsToken> {
         .context("not signed in — run `vault login` first")?;
 
     if let Some(realms_token) = &session.realms {
-        if !realms_token.is_expired() {
+        // A token saved before the XUID was captured cannot answer "is this
+        // Realm mine?", so treat it as stale too.
+        if !force && !realms_token.is_expired() && realms_token.xuid.is_some() {
             return Ok(realms_token.clone());
         }
     }
@@ -273,6 +289,33 @@ fn realms_session() -> Result<realms::auth::XstsToken> {
     session.realms = Some(token.clone());
     realms::cache::save(&session)?;
     Ok(token)
+}
+
+fn cmd_account(refresh: bool, raw: bool) -> Result<()> {
+    let session = session_with_refresh(refresh)?;
+    if raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&session.claims.unwrap_or(serde_json::Value::Null))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Gamertag: {}",
+        session.gamertag.as_deref().unwrap_or("(not supplied by Xbox)")
+    );
+    // Masked: an XUID identifies a real person and should not end up in logs
+    // or screenshots.
+    println!(
+        "Account:  {}",
+        match &session.xuid {
+            Some(x) if x.len() > 4 => format!("…{} (XUID)", &x[x.len() - 4..]),
+            Some(_) => "(short XUID)".to_owned(),
+            None => "(no XUID — Realm ownership cannot be determined)".to_owned(),
+        }
+    );
+    println!("Game:     {}", realms::client_version());
+    Ok(())
 }
 
 fn cmd_realms(raw: bool) -> Result<()> {
@@ -306,15 +349,20 @@ fn cmd_realms(raw: bool) -> Result<()> {
             r.active_slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
             r.subscription(),
             r.max_players.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
-            if r.owner { "yes" } else { "joined" },
+            r.role(),
         );
     }
     let active = realms.iter().filter(|r| !r.expired).count();
+    let mine = realms.iter().filter(|r| r.owner == Some(true)).count();
     println!(
-        "\n{} Realm(s) — {active} still subscribed, {} expired.",
+        "\n{} Realm(s) — {active} still subscribed, {} expired; {mine} yours, {} joined.",
         realms.len(),
-        realms.len() - active
+        realms.len() - active,
+        realms.iter().filter(|r| r.owner == Some(false)).count(),
     );
+    if realms.iter().any(|r| r.owner == Some(false)) {
+        println!("Only a Realm's owner can replace its world, so uploads will be limited to yours.");
+    }
     Ok(())
 }
 
