@@ -16,6 +16,16 @@ const state = {
   loginTimer: null,
 };
 
+/// Buttons are coloured by where the action lands, so the destination is
+/// obvious before clicking. Orange overrides the rest for anything that
+/// destroys or disables something.
+const TOUCHES = {
+  minecraft: "green",
+  vault: "red",
+  realm: "purple",
+  warning: "orange",
+};
+
 const EXPLAIN = {
   live: "These are the worlds Minecraft can see right now. Put one away to tidy up the in-game list — it stays safe in the vault.",
   vault: "Every world you own lives here. Press Play to put one into Minecraft. Nothing here is lost when you tidy up your game.",
@@ -119,13 +129,13 @@ function liveRows() {
     const actions = [];
     if (!w.saved) {
       actions.push(button(w.protection === "stale" ? "Save" : "Save to vault", {
-        className: "green", disabled: blocked, disabledReason: reason,
+        className: TOUCHES.vault, disabled: blocked, disabledReason: reason,
         help: "Copy this world into the vault. It stays in Minecraft.",
         onClick: () => run("save_to_vault", { folder: w.folder }),
       }));
     }
     actions.push(button("Put away", {
-      disabled: blocked, disabledReason: reason,
+      className: TOUCHES.minecraft, disabled: blocked, disabledReason: reason,
       help: "Save it to the vault and take it out of Minecraft's world list.",
       onClick: () => confirmRun(
         `Put "${w.name}" away?`,
@@ -155,27 +165,30 @@ function vaultRows() {
     const actions = [];
     if (!w.in_game) {
       actions.push(button("Play here", {
-        className: "green", disabled: blocked, disabledReason: reason,
+        className: TOUCHES.minecraft, disabled: blocked, disabledReason: reason,
         help: "Copy this world into Minecraft on this PC, so it appears in your single-player world list.",
         onClick: () => run("play", { id: w.id }),
       }));
     }
     if (state.realmTargets && state.realmTargets.length) {
       actions.push(button("Send to Realm", {
+        className: TOUCHES.realm,
         help: "Put this world onto one of your Realms, so everyone can play it.",
         onClick: () => chooseRealm(w),
       }));
     }
     actions.push(button("Back up", {
+      className: TOUCHES.vault,
       help: "Save an extra copy in Backups that you can go back to later.",
       onClick: () => run("back_up", { id: w.id }),
     }));
     actions.push(button("Share", {
+      className: TOUCHES.vault,
       help: "Make a .mcworld file you can send to a friend or copy to another device.",
       onClick: () => run("export", { id: w.id }),
     }));
     actions.push(button("Delete", {
-      className: "red",
+      className: TOUCHES.warning,
       help: "Remove it from the vault. A backup is kept, so it can still be restored.",
       onClick: () => confirmRun(
         `Delete "${w.name}" from the vault?`,
@@ -214,6 +227,7 @@ function backupRows() {
       line.append(el("span", "backup-when", b.label));
       line.append(el("span", "backup-size", humanSize(b.size_bytes)));
       line.append(button("Restore", {
+        className: TOUCHES.vault,
         help: "Put this older copy back into the vault as a separate world. Nothing you have now is changed.",
         onClick: () => confirmRun(
           `Restore "${g.name}"?`,
@@ -244,8 +258,9 @@ function realmHero(realm) {
 
   const actions = el("div", "row-actions");
   if (realm.can_download) {
+    // Reading from a Realm changes nothing there; the world lands in the vault.
     actions.append(button("Copy world to vault", {
-      className: "green",
+      className: TOUCHES.vault,
       help: "Download this Realm's current world into your vault. Nothing on the Realm changes.",
       onClick: () => confirmRun(
         `Copy "${realm.name}" into your vault?`,
@@ -254,6 +269,7 @@ function realmHero(realm) {
         { realmId: realm.id, slot: realm.active_slot, name: realm.name }),
     }));
     actions.append(button("Put a vault world here", {
+      className: TOUCHES.realm,
       help: "Replace this Realm's world with one from your vault.",
       onClick: () => chooseVaultWorld(realm),
     }));
@@ -288,7 +304,7 @@ function realmHero(realm) {
       if (realm.can_download) {
         const emptyActions = el("div", "row-actions");
         emptyActions.append(button("Put a world here", {
-          className: "green",
+          className: TOUCHES.realm,
           help: "Send a world from your vault to this slot.",
           onClick: () => chooseVaultWorld(realm, slot.slot_id),
         }));
@@ -335,7 +351,7 @@ function realmHero(realm) {
       const slotActions = el("div", "row-actions");
       if (!slot.active) {
         slotActions.append(button("Play this one", {
-          className: "green",
+          className: TOUCHES.realm,
           help: "Make this the world the Realm runs.",
           onClick: () => confirmRun(
             `Switch the Realm to "${slot.name}"?`,
@@ -344,10 +360,12 @@ function realmHero(realm) {
         }));
       }
       slotActions.append(button("Replace", {
+        className: TOUCHES.realm,
         help: "Put a different world from your vault on this slot.",
         onClick: () => chooseVaultWorld(realm, slot.slot_id),
       }));
       slotActions.append(button("Rename", {
+        className: TOUCHES.realm,
         help: "Change the world's name as shown in Minecraft.",
         onClick: () => askText(
           `Rename the world on slot ${slot.slot_id}`,
@@ -367,7 +385,7 @@ function realmHero(realm) {
       }
       if (slot.packs.length) {
         slotActions.append(button("Turn off add-ons", {
-          className: "red",
+          className: TOUCHES.warning,
           help: "Remove every add-on from this world on the Realm.",
           onClick: () => confirmRun(
             `Turn off the add-ons on slot ${slot.slot_id}?`,
@@ -410,6 +428,7 @@ function realmSummaryRow(realm) {
   const actions = [];
   if (realm.can_download) {
     actions.push(button("Copy to vault", {
+      className: TOUCHES.vault,
       help: "Download this Realm's world into your vault.",
       onClick: () => confirmRun(
         `Copy "${realm.name}" into your vault?`,
@@ -451,7 +470,7 @@ function realmRows() {
     panel.append(el("div", "big-code", state.login.user_code));
     const actions = el("div", "signin-actions");
     actions.append(button("Open the sign-in page", {
-      className: "green",
+      className: TOUCHES.realm,
       onClick: () => invoke("open_url", { url: state.login.verification_uri }).catch(() => {}),
     }));
     actions.append(button("Cancel", { onClick: cancelLogin }));
@@ -468,7 +487,7 @@ function realmRows() {
     panel.append(el("p", null,
       "Use the same Microsoft account you use for Minecraft. You will get a short code to type on Microsoft's website — Bedrock Vault never sees your password."));
     const actions = el("div", "signin-actions");
-    actions.append(button("Sign in with Microsoft", { className: "green", onClick: beginLogin }));
+    actions.append(button("Sign in with Microsoft", { className: TOUCHES.realm, onClick: beginLogin }));
     panel.append(actions);
     return [panel];
   }
@@ -694,28 +713,32 @@ function render() {
   for (const r of rows) grid.append(r);
 
   const main = document.getElementById("main-action");
-  main.className = "mc-btn green";
   main.style.display = "";
   if (state.section === "live") {
     const n = state.data.unsaved;
+    // Lands in the vault, so it is a vault action even on the Minecraft tab.
+    main.className = `mc-btn ${TOUCHES.vault}`;
     main.textContent = n ? `Save ${n} world${n > 1 ? "s" : ""} to the vault` : "Everything is saved";
     main.disabled = !n || state.busy || state.data.game_running.length > 0;
     main.onclick = () => run("save_all", {});
   } else if (state.section === "vault") {
+    main.className = `mc-btn ${TOUCHES.vault}`;
     main.textContent = "Import a world";
     main.disabled = state.busy;
     main.onclick = importWorld;
   } else if (state.section === "backups") {
+    main.className = `mc-btn ${TOUCHES.vault}`;
     main.textContent = "Open backups folder";
     main.disabled = state.busy;
     main.onclick = () => run("open_folder", { which: "backups" });
   } else if (state.section === "packs") {
+    main.className = "mc-btn";
     main.textContent = "Refresh";
     main.disabled = state.busy;
     main.onclick = () => { state.packs = null; loadPacks(); render(); };
   } else if (state.realms && state.realms.signed_in && !state.login) {
     main.textContent = "Sign out";
-    main.className = "mc-btn";
+    main.className = `mc-btn ${TOUCHES.realm}`;
     main.disabled = state.busy;
     main.onclick = () => confirmRun("Sign out?",
       "The saved sign-in is deleted from this PC. You can sign in again at any time.",
@@ -782,6 +805,8 @@ function askText(title, body, initial, onDone) {
   const ok = document.getElementById("modal-ok");
   const cancel = document.getElementById("modal-cancel");
   ok.textContent = "Save";
+  // Only used for renaming a Realm's world.
+  ok.className = `mc-btn ${TOUCHES.realm}`;
   ok.style.display = "";
 
   const field = el("input", "text-field");
@@ -898,7 +923,7 @@ function chooseRealm(world) {
   const list = el("div", "realm-choices");
   for (const realm of targets) {
     list.append(button(realm.name, {
-      className: "green",
+      className: TOUCHES.realm,
       onClick: () => {
         close();
         run("realm_upload", { realmId: realm.id, slot: realm.active_slot, id: world.id });
@@ -927,6 +952,13 @@ function confirmRun(title, body, okLabel, cmd, args) {
   const ok = document.getElementById("modal-ok");
   const cancel = document.getElementById("modal-cancel");
   ok.textContent = okLabel;
+  // The confirm button matches where the action lands, so the colour the user
+  // clicked on the row is the colour they confirm with.
+  ok.className = `mc-btn ${
+    cmd.startsWith("realm_") || cmd.startsWith("realms_") ? TOUCHES.realm
+    : cmd === "delete" || cmd === "realm_clear_packs" ? TOUCHES.warning
+    : cmd === "put_away" || cmd === "play" ? TOUCHES.minecraft
+    : TOUCHES.vault}`;
   ok.style.display = "";
 
   const close = () => {
