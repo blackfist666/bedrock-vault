@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bedrock_vault_core::{
-    config, guard, level_dat, mcworld, packs, scan,
+    config, guard, level_dat, mcworld, packs, realms, scan,
     vault::{Protection, Vault},
 };
 use chrono::{Local, TimeZone};
@@ -30,6 +30,17 @@ enum Cmd {
     Packs,
     /// Report whether Minecraft is running (world operations are blocked if so)
     Guard,
+    /// Sign in to a Microsoft account for Realms
+    Login,
+    /// Forget the signed-in Microsoft account
+    Logout,
+    /// List the Realms this account can see
+    Realms {
+        /// Print the service's raw JSON — the API is unofficial, so this is how
+        /// to see what it actually returned when a field looks wrong
+        #[arg(long)]
+        raw: bool,
+    },
     /// Show where the vault lives
     Where,
     /// Move the vault to another folder (or adopt a vault already there)
@@ -94,6 +105,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Login => cmd_login(),
+        Cmd::Logout => {
+            realms::cache::clear()?;
+            println!("Signed out — the saved tokens have been deleted.");
+            Ok(())
+        }
+        Cmd::Realms { raw } => cmd_realms(raw),
         Cmd::Where => {
             let root = vault_root.clone().unwrap_or_else(config::vault_root);
             println!("Vault:  {}", root.display());
@@ -205,6 +223,99 @@ fn open_vault(root: Option<PathBuf>) -> Result<Vault> {
 /// and readable on disk.
 fn stamp() -> String {
     Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+fn cmd_login() -> Result<()> {
+    let login = realms::auth::start_device_login()?;
+    println!("\n  Go to:  {}", login.verification_uri);
+    println!("  Enter:  {}\n", login.user_code);
+    println!("Waiting for you to finish signing in (Ctrl+C to give up)…");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(login.expires_in_secs);
+    let tokens = loop {
+        std::thread::sleep(realms::auth::poll_delay(&login));
+        if let Some(tokens) = realms::auth::poll_device_login(&login.device_code)? {
+            break tokens;
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("the code expired before sign-in finished");
+        }
+    };
+
+    let session = realms::auth::realms_session(&tokens.access_token)?;
+    let who = session.gamertag.clone().unwrap_or_else(|| "your account".into());
+    realms::cache::save(&realms::cache::Session {
+        microsoft: Some(tokens),
+        realms: Some(session),
+    })?;
+    println!("\nSigned in as {who}.");
+    Ok(())
+}
+
+/// The signed-in session, refreshed if the Realms token has aged out.
+fn realms_session() -> Result<realms::auth::XstsToken> {
+    let mut session = realms::cache::load();
+    let microsoft = session
+        .microsoft
+        .clone()
+        .context("not signed in — run `vault login` first")?;
+
+    if let Some(realms_token) = &session.realms {
+        if !realms_token.is_expired() {
+            return Ok(realms_token.clone());
+        }
+    }
+
+    println!("Refreshing sign-in…");
+    let refreshed = realms::auth::refresh(&microsoft.refresh_token)?;
+    let token = realms::auth::realms_session(&refreshed.access_token)?;
+    session.microsoft = Some(refreshed);
+    session.realms = Some(token.clone());
+    realms::cache::save(&session)?;
+    Ok(token)
+}
+
+fn cmd_realms(raw: bool) -> Result<()> {
+    let session = realms_session()?;
+    if raw {
+        println!("{}", serde_json::to_string_pretty(&realms::list_raw(&session)?)?);
+        return Ok(());
+    }
+    match &session.gamertag {
+        Some(tag) => println!("Signed in as {tag} (client version {})\n", realms::client_version()),
+        None => println!("Signed in (client version {})\n", realms::client_version()),
+    }
+
+    let realms = realms::list(&session)?;
+    if realms.is_empty() {
+        println!("No Realms on this account.");
+        println!("(That still means sign-in worked — the service answered with an empty list.)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<10} {:<28} {:<8} {:<6} {:<14} {:<8} YOURS",
+        "ID", "NAME", "STATE", "SLOT", "SUBSCRIPTION", "PLAYERS"
+    );
+    for r in &realms {
+        println!(
+            "{:<10} {:<28} {:<8} {:<6} {:<14} {:<8} {}",
+            r.id,
+            truncate(&r.name, 28),
+            r.state,
+            r.active_slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            r.subscription(),
+            r.max_players.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
+            if r.owner { "yes" } else { "joined" },
+        );
+    }
+    let active = realms.iter().filter(|r| !r.expired).count();
+    println!(
+        "\n{} Realm(s) — {active} still subscribed, {} expired.",
+        realms.len(),
+        realms.len() - active
+    );
+    Ok(())
 }
 
 fn cmd_move(root: Option<PathBuf>, dest: &std::path::Path) -> Result<()> {

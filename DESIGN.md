@@ -91,7 +91,7 @@ Key facts:
 ┌─────────────────────────────────────────────────────┐
 │ Bedrock Vault (Tauri 2.x desktop app)               │
 │                                                     │
-│  Svelte UI           Rust core                      │
+│  Plain HTML/JS UI    Rust core                      │
 │  ┌──────────┐        ┌─────────────────────────────┐│
 │  │ Library  │──IPC──►│ world scanner / NBT parser  ││
 │  │ grid     │        │ .mcworld pack/unpack (zip)  ││
@@ -114,10 +114,11 @@ Key facts:
 
 | Choice | Reason |
 |---|---|
-| Tauri 2.x / Rust / Svelte | Small binary, native file performance, matches existing tooling experience |
+| Tauri 2.x / Rust | Small binary (2.4 MB installer), native file performance, matches existing tooling experience |
+| Plain HTML/CSS/JS frontend, no bundler | **Changed from Svelte.** Svelte needs an npm build step, which the development machine cannot run. `withGlobalTauri` + a static `ui/` folder needs no toolchain at all |
 | SQLite | Library index, backup history, settings — single file, no server |
 | Rust NBT crate (`quartz_nbt` or hand-rolled LE reader) | `level.dat` is small and the schema is stable; only ~6 fields needed |
-| Node sidecar for Tier 2 | `prismarine-auth`/`prismarine-realms` are the only mature Bedrock Realms clients; re-implementing XSTS auth in Rust is not worth it. Sidecar is spawned on demand, speaks JSON-RPC over stdio, and is only shipped once Tier 2 lands |
+| ~~Node sidecar for Tier 2~~ **Realms in Rust** | **Superseded 2026-08-10.** The sidecar was chosen to avoid re-implementing XSTS auth, but bundling a Node runtime would take the installer from 2.4 MB to ~50 MB, and Node cannot be run on the development machine at all. The whole protocol is HTTPS + JSON — device-code sign-in, Xbox Live, XSTS, then the Realms API — and came to ~400 lines of Rust over `ureq`. Verified against a live account. See §7.2 |
 
 ### 5.1 Directory layout (app-managed)
 
@@ -210,19 +211,26 @@ Realm API calls, auth, cloud anything. Tier 1 ships as a fully offline tool.
 | T2-6 | **Slot → vault mapping** | Track which vault world was last pushed to each slot (`realm_slots` table); surface "slot has drifted" when Realm play has diverged from the vault copy |
 | T2-7 | **Owned-content list** | Full marketplace entitlements (including never-downloaded purchases) via the signed-in account, complementing the local T1-11 inventory |
 
-### 7.2 Sidecar protocol
+### 7.2 Auth chain (implemented in Rust)
 
-Rust spawns `node sidecar/main.js`, communicates via JSON-RPC over stdio:
+No sidecar. Four HTTPS hops, all JSON:
 
-```
-→ {"id":1,"method":"auth.start"}
-← {"id":1,"result":{"userCode":"ABC-123","verificationUri":"https://microsoft.com/link"}}
-← {"method":"auth.complete","params":{"gamertag":"..."} }
-→ {"id":2,"method":"realms.list"}
-→ {"id":3,"method":"realms.uploadWorld","params":{"realmId":"...","slot":2,"mcworldPath":"..."}}
-```
+1. **Device code** — `POST login.live.com/oauth20_connect.srf` with the Minecraft title's public client id (`00000000441cc96b`, scope `service::user.auth.xboxlive.com::MBI_SSL`). Returns a short code the user types at `microsoft.com/link`; poll `oauth20_token.srf` until they finish.
+2. **Xbox Live** — `POST user.auth.xboxlive.com/user/authenticate`, sending the Microsoft access token as `RpsTicket` (as-is for this flow; the Azure AD flow would need a `d=` prefix). Returns an XBL user token.
+3. **XSTS** — `POST xsts.auth.xboxlive.com/xsts/authorize` with relying party `https://pocket.realms.minecraft.net/`. Returns the token plus the user hash. HTTP 401 carries an `XErr` code that says *why* (no Xbox profile, child account, region), and is translated into plain words.
+4. **Realms** — `GET pocket.realms.minecraft.net/worlds` with `Authorization: XBL3.0 x=<user hash>;<token>`.
 
-Sidecar is stateless beyond the auth token cache; all orchestration (backup-first, close/reopen Realm ordering) lives in Rust so the safety rules are in one place.
+`Client-Version` is taken from the newest world's `lastOpenedWithVersion` on this machine, since Realms rejects clients it considers outdated (HTTP 426).
+
+Tokens are cached in `%APPDATA%\BedrockVault\auth.json`, never logged — error messages quote the service's own text, never the request. Sign-out deletes the file.
+
+**Observed API quirks** (verified against a live account, 8 Realms):
+
+- `owner` is always an empty string on `/worlds`; **`member`** is what distinguishes a Realm you own (`false`) from one you joined (`true`)
+- `players` is `null` unless populated; `slots` is `null` on this endpoint
+- `daysLeft` goes negative for expired Realms, and `expired` is not always set alongside it
+
+All orchestration (backup-first, close/reopen ordering) lives in Rust so the safety rules stay in one place.
 
 ### 7.3 Risks & mitigations
 

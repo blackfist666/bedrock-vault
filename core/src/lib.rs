@@ -7,5 +7,6 @@ pub mod level_dat;
 pub mod mcworld;
 pub mod nbt;
 pub mod packs;
+pub mod realms;
 pub mod scan;
 pub mod vault;

@@ -9,6 +9,7 @@ description = "Bedrock Vault core: world scanning, level.dat parsing, .mcworld p
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
 walkdir.workspace = true
 zip.workspace = true
 
