@@ -74,6 +74,14 @@ impl Realm {
 /// Realms refuses clients it thinks are out of date, and the installed game is
 /// the most reliable statement of what version this PC is really on.
 pub fn client_version() -> String {
+    // Escape hatch: Realms can refuse a client it considers behind the Realm's
+    // own server version, and the installed game is not always the answer.
+    if let Ok(forced) = std::env::var("BEDROCK_VAULT_CLIENT_VERSION") {
+        if !forced.trim().is_empty() {
+            return forced.trim().to_owned();
+        }
+    }
+
     let newest = scan::find_worlds_dirs()
         .ok()
         .into_iter()
@@ -306,6 +314,159 @@ pub fn fetch_world(
     Ok(written)
 }
 
+/// Close a Realm so its world can be replaced.
+pub fn close(session: &auth::XstsToken, realm_id: i64) -> Result<()> {
+    request(session, "PUT", &format!("/worlds/{realm_id}/close")).map(|_| ())
+}
+
+/// Reopen a Realm.
+pub fn open(session: &auth::XstsToken, realm_id: i64) -> Result<()> {
+    request(session, "PUT", &format!("/worlds/{realm_id}/open")).map(|_| ())
+}
+
+/// Send a `.mcworld` to a Realm slot.
+///
+/// As with downloads, the content host is separate from the API and takes the
+/// signed token rather than the Xbox credential.
+pub fn upload_world(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    slot: i64,
+    mcworld: &std::path::Path,
+) -> Result<()> {
+    let info = request(
+        session,
+        "GET",
+        &format!("/archive/upload/world/{realm_id}/{slot}"),
+    )?;
+    let url = info["uploadUrl"]
+        .as_str()
+        .context("the service did not return an upload address")?;
+    let token = info["token"].as_str().unwrap_or_default();
+
+    let bytes = std::fs::read(mcworld)
+        .with_context(|| format!("reading {}", mcworld.display()))?;
+    if bytes.is_empty() {
+        bail!("refusing to upload an empty file");
+    }
+
+    // The verb is not documented anywhere; POST is what the service accepts,
+    // with PUT tried only if it reports the method is wrong.
+    match send_world(url, token, "POST", &bytes) {
+        Err(UploadError::MethodNotAllowed) => match send_world(url, token, "PUT", &bytes) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
+        Ok(()) => Ok(()),
+    }
+}
+
+enum UploadError {
+    MethodNotAllowed,
+    Other(anyhow::Error),
+}
+
+impl From<UploadError> for anyhow::Error {
+    fn from(e: UploadError) -> Self {
+        match e {
+            UploadError::MethodNotAllowed => anyhow!("the upload server rejected the request method"),
+            UploadError::Other(e) => e,
+        }
+    }
+}
+
+fn send_world(url: &str, token: &str, method: &str, bytes: &[u8]) -> Result<(), UploadError> {
+    let mut request = ureq::request(method, url)
+        .set("User-Agent", "MCPE/UWP")
+        .set("Content-Type", "application/octet-stream");
+    if !token.is_empty() {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    match request.send_bytes(bytes) {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(405, _)) => Err(UploadError::MethodNotAllowed),
+        Err(ureq::Error::Status(code, resp)) => {
+            let detail: String = resp.into_string().unwrap_or_default().chars().take(300).collect();
+            Err(UploadError::Other(anyhow!(
+                "the upload failed with HTTP {code}: {detail}"
+            )))
+        }
+        Err(ureq::Error::Transport(t)) => Err(UploadError::Other(anyhow!(
+            "could not reach the upload server: {t}"
+        ))),
+    }
+}
+
+/// Replace a Realm slot's world with one from the vault.
+///
+/// The only destructive thing this app does to somebody else's server, so the
+/// order is fixed and not optional:
+///
+/// 1. **Download the Realm's current world into the vault first.** If anything
+///    later goes wrong, what was on the Realm still exists locally.
+/// 2. Close the Realm, so nobody is playing while the world is swapped.
+/// 3. Upload.
+/// 4. Reopen — attempted even when the upload fails, so a failure never leaves
+///    the Realm shut.
+pub fn replace_slot_world(
+    session: &auth::XstsToken,
+    vault: &crate::vault::Vault,
+    realm_id: i64,
+    slot: i64,
+    world_dir: &std::path::Path,
+    stamp: &str,
+    close_first: bool,
+    mut on_step: impl FnMut(&str),
+    on_progress: impl FnMut(u64, u64),
+) -> Result<crate::vault::LibraryEntry> {
+    on_step("Saving the Realm's current world to your vault");
+    let backup = slot_download(session, realm_id, slot, None)
+        .context("asking the Realm for its current world")?;
+    let temp_backup = vault
+        .exports_dir()
+        .join(format!("realm-{realm_id}-slot{slot}-before-{stamp}.mcworld"));
+    fetch_world(&backup, &temp_backup, on_progress)
+        .context("downloading the Realm's current world")?;
+    let saved = vault
+        .import_mcworld(&temp_backup, stamp)
+        .context("saving the Realm's current world into the vault")?;
+    std::fs::remove_file(&temp_backup).ok();
+
+    on_step("Packing your world");
+    let outgoing = vault
+        .exports_dir()
+        .join(format!("upload-{realm_id}-slot{slot}.mcworld"));
+    crate::mcworld::pack(world_dir, &outgoing).context("packing the world to upload")?;
+
+    let mut closed = false;
+    if close_first {
+        on_step("Closing the Realm");
+        close(session, realm_id).context("closing the Realm")?;
+        closed = true;
+    }
+
+    on_step("Uploading");
+    let uploaded = upload_world(session, realm_id, slot, &outgoing);
+    std::fs::remove_file(&outgoing).ok();
+
+    // Reopen whatever happened, so a failed upload never leaves it closed.
+    let reopened = if closed {
+        on_step("Reopening the Realm");
+        open(session, realm_id)
+    } else {
+        Ok(())
+    };
+
+    uploaded.context("uploading the world to the Realm")?;
+    if let Err(e) = reopened {
+        return Err(e).context(
+            "the world uploaded, but the Realm could not be reopened — open it from the game",
+        );
+    }
+    Ok(saved)
+}
+
 /// An authenticated **GET** against any Realms path.
 ///
 /// The API is unofficial and undocumented, so exploring it against a live
@@ -318,15 +479,26 @@ pub fn get(session: &auth::XstsToken, path: &str) -> Result<serde_json::Value> {
 /// One authenticated call to the Realms service.
 fn request(session: &auth::XstsToken, method: &str, path: &str) -> Result<serde_json::Value> {
     let url = format!("{REALMS_BASE}{path}");
-    let response = ureq::request(method, &url)
+    // `Accept: application/json` makes the open/close endpoints answer 406:
+    // they reply with a bare `true`, not JSON. Accept anything.
+    let call = ureq::request(method, &url)
         .set("Authorization", &session.authorization())
         .set("Client-Version", &client_version())
         .set("User-Agent", "MCPE/UWP")
-        .set("Accept", "application/json")
-        .call();
+        .set("Accept", "*/*");
+
+    // State-changing calls carry no payload, but must still say so: a PUT with
+    // no Content-Length at all is not accepted.
+    let response = if method == "GET" {
+        call.call()
+    } else {
+        call.set("Content-Type", "application/json").send_string("")
+    };
 
     match response {
-        Ok(ok) => ok.into_json().context("reading the Realms response"),
+        // Some endpoints (open/close) answer with a bare "true" or nothing at
+        // all, which is success rather than a malformed reply.
+        Ok(ok) => Ok(ok.into_json().unwrap_or(serde_json::Value::Null)),
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             // The service wraps its reason in {"errorCode":..,"errorMsg":".."}.

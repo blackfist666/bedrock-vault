@@ -66,6 +66,26 @@ enum Cmd {
         #[arg(long)]
         backup: Option<String>,
     },
+    /// Replace a Realm's world with one from the vault
+    RealmUpload {
+        /// Realm id shown by `realms`
+        realm: i64,
+        /// Library id shown by `library`
+        id: String,
+        /// Slot to replace; defaults to the Realm's active slot
+        #[arg(long)]
+        slot: Option<i64>,
+        /// Required: this overwrites the world on the Realm
+        #[arg(long)]
+        yes: bool,
+        /// Upload without closing the Realm first
+        #[arg(long)]
+        skip_close: bool,
+    },
+    /// Close a Realm (players are disconnected until it is opened again)
+    RealmClose { realm: i64 },
+    /// Open a Realm again
+    RealmOpen { realm: i64 },
     /// Read any Realms API path (GET only) — for exploring an undocumented API
     Api {
         /// Path such as /worlds/12345 or /worlds/12345/backups
@@ -148,6 +168,19 @@ fn main() -> Result<()> {
         Cmd::RealmBackups { realm } => cmd_realm_backups(realm),
         Cmd::RealmDownload { realm, slot, backup } => {
             cmd_realm_download(vault_root, realm, slot, backup.as_deref())
+        }
+        Cmd::RealmUpload { realm, id, slot, yes, skip_close } => {
+            cmd_realm_upload(vault_root, realm, &id, slot, yes, !skip_close)
+        }
+        Cmd::RealmClose { realm } => {
+            realms::close(&realms_session()?, realm)?;
+            println!("Realm {realm} is closed.");
+            Ok(())
+        }
+        Cmd::RealmOpen { realm } => {
+            realms::open(&realms_session()?, realm)?;
+            println!("Realm {realm} is open.");
+            Ok(())
         }
         Cmd::Api { path } => {
             let session = realms_session()?;
@@ -464,6 +497,66 @@ fn cmd_realm_download(
         entry.name,
         entry.id,
         human_size(entry.size_bytes)
+    );
+    Ok(())
+}
+
+fn cmd_realm_upload(
+    root: Option<PathBuf>,
+    realm_id: i64,
+    id: &str,
+    slot: Option<i64>,
+    yes: bool,
+    close_first: bool,
+) -> Result<()> {
+    let vault = open_vault(root)?;
+    let entry = vault.entry(id)?;
+    let session = realms_session()?;
+
+    let realm = realms::list(&session)?
+        .into_iter()
+        .find(|r| r.id == realm_id)
+        .with_context(|| format!("no Realm with id {realm_id} on this account"))?;
+    if realm.owner != Some(true) {
+        anyhow::bail!("only a Realm's owner can replace its world");
+    }
+    let slot = slot
+        .or(realm.active_slot)
+        .context("could not tell which slot to replace; pass --slot")?;
+
+    if !yes {
+        println!(
+            "This replaces the world on \"{}\" slot {slot} with \"{}\".",
+            realm.name, entry.name
+        );
+        println!("The Realm's current world is saved to your vault first.");
+        println!("Re-run with --yes to go ahead.");
+        return Ok(());
+    }
+
+    let saved = realms::replace_slot_world(
+        &session,
+        &vault,
+        realm_id,
+        slot,
+        &entry.world_dir,
+        &stamp(),
+        close_first,
+        |step| println!("  {step}…"),
+        |done, total| {
+            if total > 0 && done == total {
+                println!("    {} saved", human_size(done));
+            }
+        },
+    )?;
+
+    println!(
+        "\nDone. \"{}\" is now on \"{}\" slot {slot}.",
+        entry.name, realm.name
+    );
+    println!(
+        "The Realm's previous world was saved to your vault as \"{}\" ({}).",
+        saved.name, saved.id
     );
     Ok(())
 }
