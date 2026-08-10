@@ -12,24 +12,64 @@ const PACKAGE_IDS: &[&str] = &[
     "Microsoft.MinecraftWindowsBeta_8wekyb3d8bbwe", // preview
 ];
 
-/// Resolve the live minecraftWorlds directory, preferring the release package.
+/// A live world location the game may read from.
+pub struct WorldsLocation {
+    /// Human label, e.g. `GDK user 168…474` or `UWP`.
+    pub label: String,
+    pub path: PathBuf,
+}
+
+/// Find every live minecraftWorlds directory on this machine.
 ///
-/// The folder does not exist until the game first creates or downloads a local
-/// world, so an installed game with a `com.mojang` tree but no `minecraftWorlds`
-/// resolves to the path the game *will* use (which may not exist yet).
-pub fn find_worlds_dir() -> Result<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA")
-        .map_err(|_| anyhow::anyhow!("LOCALAPPDATA is not set"))?;
-    for pkg in PACKAGE_IDS {
-        let mojang = Path::new(&local)
-            .join("Packages")
-            .join(pkg)
-            .join(r"LocalState\games\com.mojang");
-        if mojang.is_dir() {
-            return Ok(mojang.join("minecraftWorlds"));
+/// Two storage layouts exist:
+/// - **GDK** (current, new launcher): `%APPDATA%\Minecraft Bedrock\Users\<xuid-or-Shared>\games\com.mojang\minecraftWorlds` — one folder per signed-in profile
+/// - **UWP** (legacy Store package): `%LOCALAPPDATA%\Packages\<pkg>\LocalState\games\com.mojang\minecraftWorlds` — may be a junction to another drive if the app was moved
+///
+/// A `com.mojang` tree without `minecraftWorlds` means the install exists but no
+/// local world has been created yet; such locations are still returned (the game
+/// will create the folder) and scan as empty.
+pub fn find_worlds_dirs() -> Result<Vec<WorldsLocation>> {
+    let mut found = Vec::new();
+
+    if let Ok(roaming) = std::env::var("APPDATA") {
+        let users = Path::new(&roaming).join(r"Minecraft Bedrock\Users");
+        if users.is_dir() {
+            let mut profiles: Vec<_> = fs::read_dir(&users)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .collect();
+            profiles.sort_by_key(|e| e.file_name());
+            for profile in profiles {
+                let mojang = profile.path().join(r"games\com.mojang");
+                if mojang.is_dir() {
+                    found.push(WorldsLocation {
+                        label: format!("GDK {}", profile.file_name().to_string_lossy()),
+                        path: mojang.join("minecraftWorlds"),
+                    });
+                }
+            }
         }
     }
-    bail!("no Bedrock com.mojang directory found under LOCALAPPDATA (is Minecraft installed?)");
+
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        for pkg in PACKAGE_IDS {
+            let mojang = Path::new(&local)
+                .join("Packages")
+                .join(pkg)
+                .join(r"LocalState\games\com.mojang");
+            if mojang.is_dir() {
+                found.push(WorldsLocation {
+                    label: if pkg.contains("Beta") { "UWP preview".into() } else { "UWP".into() },
+                    path: mojang.join("minecraftWorlds"),
+                });
+            }
+        }
+    }
+
+    if found.is_empty() {
+        bail!("no Bedrock com.mojang directory found (is Minecraft installed?)");
+    }
+    Ok(found)
 }
 
 pub struct ScannedWorld {

@@ -61,43 +61,53 @@ fn main() -> Result<()> {
 }
 
 fn cmd_scan(dir: Option<PathBuf>) -> Result<()> {
-    let dir = match dir {
-        Some(d) => d,
-        None => scan::find_worlds_dir()?,
+    let locations = match dir {
+        Some(d) => vec![scan::WorldsLocation { label: "custom".into(), path: d }],
+        None => scan::find_worlds_dirs()?,
     };
-    println!("Scanning {}\n", dir.display());
-    if !dir.is_dir() {
-        println!("Directory does not exist yet — the game creates it with the first local world.");
-        println!("0 worlds.");
-        return Ok(());
-    }
-    let worlds = scan::scan(&dir)?;
 
-    println!(
-        "{:<14} {:<28} {:<9} {:<12} {:<16} {:>9}  {:<20}",
-        "FOLDER", "NAME", "MODE", "VERSION", "LAST PLAYED", "SIZE", "SEED"
-    );
-    for w in &worlds {
-        match &w.meta {
-            Ok(m) => println!(
-                "{:<14} {:<28} {:<9} {:<12} {:<16} {:>9}  {:<20}",
-                truncate(&w.folder, 14),
-                truncate(&w.display_name(), 28),
-                m.game_mode_label(),
-                m.version.as_deref().unwrap_or("-"),
-                m.last_played.map(fmt_time).unwrap_or_else(|| "-".into()),
-                human_size(w.size_bytes),
-                m.seed.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
-            ),
-            Err(e) => println!(
-                "{:<14} {:<28} !! level.dat unreadable: {e:#}",
-                truncate(&w.folder, 14),
-                truncate(&w.display_name(), 28),
-            ),
+    let mut grand_count = 0usize;
+    let mut grand_size = 0u64;
+    for loc in &locations {
+        println!("[{}] {}", loc.label, loc.path.display());
+        if !loc.path.is_dir() {
+            println!("  (does not exist yet — the game creates it with the first local world)\n");
+            continue;
         }
+        let worlds = scan::scan(&loc.path)?;
+        if worlds.is_empty() {
+            println!("  (empty)\n");
+            continue;
+        }
+        println!(
+            "{:<14} {:<28} {:<9} {:<12} {:<16} {:>9}  {:<20}",
+            "FOLDER", "NAME", "MODE", "VERSION", "LAST PLAYED", "SIZE", "SEED"
+        );
+        for w in &worlds {
+            match &w.meta {
+                Ok(m) => println!(
+                    "{:<14} {:<28} {:<9} {:<12} {:<16} {:>9}  {:<20}",
+                    truncate(&w.folder, 14),
+                    truncate(&w.display_name(), 28),
+                    m.game_mode_label(),
+                    m.version.as_deref().unwrap_or("-"),
+                    m.last_played.map(fmt_time).unwrap_or_else(|| "-".into()),
+                    human_size(w.size_bytes),
+                    m.seed.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                ),
+                Err(e) => println!(
+                    "{:<14} {:<28} !! level.dat unreadable: {e:#}",
+                    truncate(&w.folder, 14),
+                    truncate(&w.display_name(), 28),
+                ),
+            }
+        }
+        let size: u64 = worlds.iter().map(|w| w.size_bytes).sum();
+        println!("  {} world(s), {}\n", worlds.len(), human_size(size));
+        grand_count += worlds.len();
+        grand_size += size;
     }
-    let total: u64 = worlds.iter().map(|w| w.size_bytes).sum();
-    println!("\n{} world(s), {} total", worlds.len(), human_size(total));
+    println!("Total: {} world(s), {}", grand_count, human_size(grand_size));
     Ok(())
 }
 
