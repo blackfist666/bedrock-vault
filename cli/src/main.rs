@@ -1,18 +1,16 @@
-mod level_dat;
-mod mcworld;
-mod nbt;
-mod packs;
-mod scan;
-
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use bedrock_vault_core::{guard, level_dat, mcworld, packs, scan, vault::Vault};
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "vault", version, about = "Bedrock Vault M0 spike")]
+#[command(name = "vault", version, about = "Bedrock Vault")]
 struct Cli {
+    /// Vault root directory (default: %USERPROFILE%\BedrockVault)
+    #[arg(long, global = true)]
+    vault: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -27,6 +25,24 @@ enum Cmd {
     },
     /// List installed store/marketplace content and per-world pack usage
     Packs,
+    /// Report whether Minecraft is running (world operations are blocked if so)
+    Guard,
+    /// List worlds held in the vault library
+    Library,
+    /// Move a live world out of minecraftWorlds into the library
+    Archive {
+        /// Live world folder, or the folder id shown by `scan`
+        world: String,
+    },
+    /// Copy a library world back into minecraftWorlds
+    Activate {
+        /// Library id shown by `library`
+        id: String,
+    },
+    /// Import a .mcworld (or a world folder) into the library
+    Import { path: PathBuf },
+    /// Export a library world as a .mcworld into the vault's exports folder
+    Export { id: String },
     /// Pack a world folder into a .mcworld
     Pack { world_dir: PathBuf, out: PathBuf },
     /// Unpack a .mcworld into a new folder and validate it
@@ -34,9 +50,25 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let vault_root = cli.vault.clone();
+    match cli.cmd {
         Cmd::Scan { dir } => cmd_scan(dir),
         Cmd::Packs => cmd_packs(),
+        Cmd::Guard => {
+            let status = guard::game_status();
+            if status.is_running() {
+                println!("Minecraft IS running ({}) — world operations blocked", status.running.join(", "));
+            } else {
+                println!("Minecraft is not running — safe to move world data");
+            }
+            Ok(())
+        }
+        Cmd::Library => cmd_library(vault_root),
+        Cmd::Archive { world } => cmd_archive(vault_root, &world),
+        Cmd::Activate { id } => cmd_activate(vault_root, &id),
+        Cmd::Import { path } => cmd_import(vault_root, &path),
+        Cmd::Export { id } => cmd_export(vault_root, &id),
         Cmd::Pack { world_dir, out } => {
             let files = mcworld::pack(&world_dir, &out)?;
             println!(
@@ -112,6 +144,136 @@ fn cmd_scan(dir: Option<PathBuf>) -> Result<()> {
         grand_size += size;
     }
     println!("Total: {} world(s), {}", grand_count, human_size(grand_size));
+    Ok(())
+}
+
+fn open_vault(root: Option<PathBuf>) -> Result<Vault> {
+    let root = match root {
+        Some(r) => r,
+        None => PathBuf::from(std::env::var("USERPROFILE").context("USERPROFILE is not set")?)
+            .join("BedrockVault"),
+    };
+    Vault::open(root)
+}
+
+/// Vault ids and folder names are timestamp-based, so operations are ordered
+/// and readable on disk.
+fn stamp() -> String {
+    Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+fn cmd_library(root: Option<PathBuf>) -> Result<()> {
+    let vault = open_vault(root)?;
+    println!("Vault: {}\n", vault.root.display());
+    let entries = vault.list()?;
+    if entries.is_empty() {
+        println!("Library is empty — use `vault archive <world>` or `vault import <file>`.");
+        return Ok(());
+    }
+    println!(
+        "{:<18} {:<28} {:<9} {:<12} {:<16} {:>9}",
+        "ID", "NAME", "MODE", "VERSION", "LAST PLAYED", "SIZE"
+    );
+    for e in &entries {
+        println!(
+            "{:<18} {:<28} {:<9} {:<12} {:<16} {:>9}",
+            e.id,
+            truncate(&e.name, 28),
+            e.game_mode,
+            e.version.as_deref().unwrap_or("-"),
+            e.last_played.map(fmt_time).unwrap_or_else(|| "-".into()),
+            human_size(e.size_bytes),
+        );
+    }
+    let total: u64 = entries.iter().map(|e| e.size_bytes).sum();
+    println!("\n{} world(s), {}", entries.len(), human_size(total));
+    Ok(())
+}
+
+/// Accept either a full path or a `minecraftWorlds` folder id.
+fn resolve_live_world(world: &str) -> Result<PathBuf> {
+    let direct = PathBuf::from(world);
+    if direct.join("level.dat").is_file() {
+        return Ok(direct);
+    }
+    for loc in scan::find_worlds_dirs()? {
+        let candidate = loc.path.join(world);
+        if candidate.join("level.dat").is_file() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("no world folder found for '{world}'")
+}
+
+fn cmd_archive(root: Option<PathBuf>, world: &str) -> Result<()> {
+    let vault = open_vault(root)?;
+    let live = resolve_live_world(world)?;
+    println!("Archiving {} …", live.display());
+    let entry = vault.archive(&live, &stamp())?;
+    println!(
+        "Archived \"{}\" as {} ({}) — backup taken, removed from the in-game list.",
+        entry.name,
+        entry.id,
+        human_size(entry.size_bytes)
+    );
+    Ok(())
+}
+
+fn cmd_activate(root: Option<PathBuf>, id: &str) -> Result<()> {
+    let vault = open_vault(root)?;
+    let entry = vault.entry(id)?;
+    let locations = scan::find_worlds_dirs()?;
+    let target = locations
+        .first()
+        .context("no Minecraft install found to activate into")?;
+    let dest = vault.activate(id, &target.path, &stamp())?;
+    println!(
+        "Activated \"{}\" into [{}] {} — it will appear in the in-game world list.",
+        entry.name,
+        target.label,
+        dest.display()
+    );
+    if locations.len() > 1 {
+        println!(
+            "(note: {} world locations exist; used the first)",
+            locations.len()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_import(root: Option<PathBuf>, path: &std::path::Path) -> Result<()> {
+    let vault = open_vault(root)?;
+    let entry = if path.is_dir() {
+        vault.import_folder(path, &stamp())?
+    } else {
+        vault.import_mcworld(path, &stamp())?
+    };
+    println!(
+        "Imported \"{}\" as {} ({})",
+        entry.name,
+        entry.id,
+        human_size(entry.size_bytes)
+    );
+    Ok(())
+}
+
+fn cmd_export(root: Option<PathBuf>, id: &str) -> Result<()> {
+    let vault = open_vault(root)?;
+    let entry = vault.entry(id)?;
+    let safe: String = entry
+        .name
+        .chars()
+        .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .collect();
+    let out = vault.exports_dir().join(format!("{safe}.mcworld"));
+    let files = mcworld::pack(&entry.world_dir, &out)?;
+    println!(
+        "Exported {} file(s) to {} ({})",
+        files,
+        out.display(),
+        human_size(std::fs::metadata(&out)?.len())
+    );
     Ok(())
 }
 

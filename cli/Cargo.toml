@@ -1,0 +1,16 @@
+[package]
+name = "bedrock-vault-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bedrock Vault command-line interface"
+
+[[bin]]
+name = "vault"
+path = "src/main.rs"
+
+[dependencies]
+bedrock-vault-core = { path = "../core" }
+anyhow.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }

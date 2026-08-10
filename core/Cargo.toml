@@ -1,0 +1,13 @@
+[package]
+name = "bedrock-vault-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bedrock Vault core: world scanning, level.dat parsing, .mcworld packaging, vault operations"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+zip.workspace = true

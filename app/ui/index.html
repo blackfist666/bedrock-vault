@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Bedrock Vault</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Bedrock Vault</h1>
+      <div id="status" class="status"></div>
+    </header>
+
+    <div id="banner" class="banner hidden"></div>
+
+    <nav class="tabs">
+      <button class="tab active" data-filter="all">All worlds</button>
+      <button class="tab" data-filter="active">In game</button>
+      <button class="tab" data-filter="library">Vault</button>
+      <input id="search" type="search" placeholder="Search worlds…" />
+      <button id="refresh" class="ghost">Refresh</button>
+    </nav>
+
+    <main id="grid" class="grid"></main>
+
+    <footer id="footer"></footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
