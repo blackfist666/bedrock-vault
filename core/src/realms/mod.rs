@@ -384,6 +384,44 @@ pub fn switch_to_slot(session: &auth::XstsToken, realm_id: i64, slot: i64) -> Re
     request(session, "PUT", &format!("/worlds/{realm_id}/slot/{slot}")).map(|_| ())
 }
 
+/// Which slot the Realm is currently running.
+fn state_active_slot(session: &auth::XstsToken, realm_id: i64) -> Result<Option<i64>> {
+    let body = request(session, "GET", &format!("/worlds/{realm_id}"))?;
+    Ok(body["activeSlot"].as_i64())
+}
+
+/// Switch slots and wait until the Realm reports it has actually moved.
+///
+/// Like closing, switching is asynchronous. Acting immediately afterwards —
+/// asking to download the world, say — still hits the previous slot and the
+/// service answers HTTP 500.
+pub fn switch_and_wait(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    slot: i64,
+    mut on_wait: impl FnMut(u64),
+) -> Result<()> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(4);
+    const ATTEMPTS: u64 = 15;
+
+    if let Err(e) = switch_to_slot(session, realm_id, slot) {
+        let message = format!("{e:#}");
+        if !message.contains("busy or unavailable") {
+            return Err(e);
+        }
+    }
+    for attempt in 1..=ATTEMPTS {
+        if state_active_slot(session, realm_id)? == Some(slot) {
+            // The world still needs a moment to be servable after the switch.
+            std::thread::sleep(POLL);
+            return Ok(());
+        }
+        std::thread::sleep(POLL);
+        on_wait(attempt * POLL.as_secs());
+    }
+    bail!("the Realm did not switch to slot {slot} in time")
+}
+
 /// Two spellings of the same rule arrive from different parts of the payload.
 fn dedupe_rules(rules: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
@@ -489,6 +527,16 @@ pub fn slot_download(
         token: body["token"].as_str().unwrap_or_default().to_owned(),
         size_bytes: body["size"].as_u64().unwrap_or(0),
     })
+}
+
+/// Whether Minecraft will actually hand over this slot's world.
+///
+/// It often will not. The download serves Mojang's own stored copy, and a world
+/// only just uploaded has none yet — the service answers HTTP 500 rather than
+/// saying so. Worth checking before promising the user a backup that cannot be
+/// taken. Asks for the address only; nothing is downloaded.
+pub fn slot_is_downloadable(session: &auth::XstsToken, realm_id: i64, slot: i64) -> bool {
+    slot_download(session, realm_id, slot, None).is_ok()
 }
 
 /// Stream a slot's world to disk as a `.mcworld`.
@@ -695,8 +743,9 @@ pub struct Replacement<'a> {
     pub close_first: bool,
     /// Download the slot's current world into the vault first.
     ///
-    /// Only ever false for a slot that holds no world, where there is nothing
-    /// to lose. Never skip it for a slot in use.
+    /// False only when there is nothing to save: an empty slot, or one whose
+    /// world Minecraft will not serve (see [`slot_is_downloadable`]). Never
+    /// skip it for a slot whose world can actually be fetched.
     pub backup_first: bool,
 }
 
@@ -708,6 +757,9 @@ pub fn replace_slot_world(
     on_progress: impl FnMut(u64, u64),
 ) -> Result<Option<crate::vault::LibraryEntry>> {
     let Replacement { realm_id, slot, world_dir, stamp, close_first, backup_first } = *job;
+
+    // Uploading makes a slot the live one, so remember what was playing.
+    let was_active = state_active_slot(session, realm_id)?;
 
     let saved = if backup_first {
         on_step("Saving the Realm's current world to your vault");
@@ -768,6 +820,16 @@ pub fn replace_slot_world(
     on_step("Naming the world on the Realm");
     let name = crate::vault::world_display_name(world_dir).unwrap_or_else(|| "World".to_owned());
     let _ = describe_uploaded_slot(session, realm_id, slot, world_dir, &name);
+
+    // Uploading makes a slot the live one. If the Realm was playing something
+    // else before, put it back: replacing a spare slot should not drag everyone
+    // off the world they were on.
+    if let Some(original) = was_active {
+        if original != slot {
+            on_step("Putting the Realm back on the world it was playing");
+            let _ = switch_to_slot(session, realm_id, original);
+        }
+    }
 
     Ok(saved)
 }

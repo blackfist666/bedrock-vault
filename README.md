@@ -6,13 +6,20 @@ See [DESIGN.md](DESIGN.md) for the full design.
 
 ## Status
 
-Early development. **Tier 1** (local library) is in progress; **Tier 2** (Microsoft sign-in, Realm slot download/upload) is designed but not started.
+**v0.1.0** — first release. Both tiers work: the local library, and Realms
+(sign-in, listing, slot download and upload). See the
+[changelog](CHANGELOG.md) for what is in it, and its *Known limits* for what is
+not.
 
 | Milestone | State |
 |---|---|
-| M0 — format spike (`level.dat` parsing, `.mcworld` round-trip) | Done, verified on real worlds |
-| M1 — library MVP (grid UI, archive/activate, backups, process guard) | In progress |
-| M2–M4 | Not started |
+| M0 — format spike (`level.dat` parsing, `.mcworld` round-trip) | Done |
+| M1 — library (world list, put away/play, backups, process guard) | Done |
+| M2 — import/export, rename, retention, configurable vault folder | Done |
+| M3 — Realm sign-in, listing, slot download | Done |
+| M4 — Realm upload with mandatory pre-backup | Done |
+
+Verified against a live account and a live Realm, in both directions.
 
 ## Layout
 
@@ -43,6 +50,21 @@ vault archive <world>    # move a live world into the vault (backup first)
 vault activate <id>      # copy a vault world back into the in-game list
 vault import <path>      # import a .mcworld or world folder
 vault export <id>        # write a .mcworld into the vault's exports folder
+vault backups            # every backup, grouped by world
+vault where / move <dir> # where the vault lives, and moving it
+```
+
+Realms:
+
+```
+vault login / logout     # Microsoft sign-in (device code)
+vault account            # who is signed in
+vault realms             # every Realm on the account
+vault realm <id>         # slots, worlds, add-ons, players
+vault realm-download <id>          # copy a Realm's world into the vault
+vault realm-upload <id> <world-id> # put a vault world on a Realm (--yes)
+vault realm-name / realm-slot / realm-open / realm-close
+vault api <path>         # GET any Realms path — the API is undocumented
 ```
 
 The vault lives at `%USERPROFILE%\BedrockVault` unless `--vault <path>` is given.

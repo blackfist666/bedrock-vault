@@ -637,11 +637,17 @@ fn cmd_realm_upload(
     let slot = slot
         .or(realm.active_slot)
         .context("could not tell which slot to replace; pass --slot")?;
-    // An empty slot has no world to save first.
+    // Only back up when there is something Minecraft will actually hand over:
+    // an empty slot has nothing, and a freshly-uploaded world has no stored
+    // copy yet (the service answers 500 rather than saying so).
     let occupied = realms::detail(&session, realm_id)?
         .slots
         .iter()
         .any(|s| s.slot_id == slot && !s.empty);
+    let backup_first = occupied && realms::slot_is_downloadable(&session, realm_id, slot);
+    if occupied && !backup_first {
+        println!("Note: Minecraft has no saved copy of that slot's world, so it cannot be kept.");
+    }
 
     if !yes {
         println!(
@@ -662,7 +668,7 @@ fn cmd_realm_upload(
             world_dir: &entry.world_dir,
             stamp: &stamp(),
             close_first,
-            backup_first: occupied,
+            backup_first,
         },
         |step| println!("  {step}…"),
         |done, total| {
@@ -681,6 +687,9 @@ fn cmd_realm_upload(
             "The Realm's previous world was saved to your vault as \"{}\" ({}).",
             saved.name, saved.id
         ),
+        None if occupied => {
+            println!("Minecraft had no saved copy of the previous world, so none was kept.")
+        }
         None => println!("That slot was empty, so there was nothing to save first."),
     }
     Ok(())
