@@ -375,6 +375,7 @@ function realmHero(realm) {
       }));
       if (slot.can_backup) {
         slotActions.append(button("Copy to vault", {
+          className: TOUCHES.vault,
           help: "Download this slot's world into your vault. Nothing on the Realm changes.",
           onClick: () => confirmRun(
             `Copy "${slot.name}" into your vault?`,
