@@ -9,6 +9,11 @@
   --edge: #545456;
   --text: #ffffff;
   --muted: #a5a5a7;
+  /* Panels are translucent so the wallpaper reads through them. Kept dark
+     enough that white text stays legible over a bright image. */
+  --panel-see: rgba(43, 44, 46, 0.80);
+  --panel-see-hi: rgba(58, 59, 62, 0.86);
+  --panel-solid: rgba(30, 31, 34, 0.86);
   --green: #4c8c2b;
   --green-hi: #5aa332;
   --green-edge: #2f5a1a;
@@ -37,6 +42,27 @@ body {
   color: var(--text);
   font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+/* One of the wallpapers, chosen at random each launch. Fixed and behind
+   everything, with a dark wash over it so panel text stays readable whichever
+   image comes up — some are bright snow, others near-black firelight. */
+#wallpaper {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-color: var(--bg);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+#wallpaper::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(rgba(12, 12, 14, 0.62), rgba(12, 12, 14, 0.78));
 }
 
 /* Minecraft's UI puts a hard shadow under almost all text. */
@@ -49,7 +75,7 @@ header {
   align-items: center;
   justify-content: space-between;
   padding: 14px 20px;
-  background: var(--panel);
+  background: var(--panel-see);
   border-bottom: 3px solid var(--line);
 }
 
@@ -75,7 +101,7 @@ header {
 
 /* A Realm shown in full. */
 .hero {
-  background: var(--panel);
+  background: var(--panel-see);
   border: 2px solid var(--edge);
   border-left: 5px solid var(--purple);
   padding: 16px 18px;
@@ -92,7 +118,7 @@ header {
 .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
 
 .slot {
-  background: #26272a;
+  background: var(--panel-solid);
   border: 2px solid var(--line);
   padding: 12px 14px;
   display: flex;
@@ -145,7 +171,7 @@ header {
   display: flex;
   gap: 4px;
   padding: 10px 20px 0;
-  background: var(--panel);
+  background: var(--panel-see);
   border-bottom: 3px solid var(--line);
 }
 
@@ -248,12 +274,12 @@ header {
   display: flex;
   align-items: center;
   gap: 14px;
-  background: var(--panel);
+  background: var(--panel-see);
   border: 2px solid transparent;
   padding: 12px 14px;
 }
 
-.row:hover { background: var(--panel-hi); border-color: var(--edge); }
+.row:hover { background: var(--panel-see-hi); border-color: var(--edge); }
 
 .thumb {
   width: 96px;
@@ -324,7 +350,7 @@ button.link:hover:not(:disabled) { color: var(--text); }
 .backup-size { font-variant-numeric: tabular-nums; }
 
 /* Sign-in panel */
-.signin { background: var(--panel); border: 2px solid var(--edge); padding: 26px; text-align: center; }
+.signin { background: var(--panel-see); border: 2px solid var(--edge); padding: 26px; text-align: center; }
 .signin h2 { margin: 0 0 8px; font-size: 18px; }
 .signin p { margin: 0 auto 18px; color: var(--muted); max-width: 460px; font-size: 13.5px; }
 
@@ -372,7 +398,7 @@ footer { padding: 4px 20px 20px; color: var(--muted); font-size: 12px; }
 }
 
 .modal-box {
-  background: var(--panel);
+  background: rgba(38, 39, 42, 0.97);
   border: 3px solid var(--edge);
   padding: 22px 24px;
   max-width: 460px;
