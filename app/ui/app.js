@@ -361,12 +361,12 @@ listen("progress", (event) => {
 
 /// Watch for Minecraft opening or closing.
 ///
-/// Without this the guard is only checked when the window opens, so starting
-/// the game afterwards leaves every button live — exactly the case the guard
-/// exists to prevent. Only the cheap process check runs on the timer; the full
-/// listing is reloaded once, when the game closes and worlds may have changed.
+/// This only drives the on-screen warning: every operation re-checks the guard
+/// in the backend before touching anything, so safety never depends on the poll
+/// being recent. It is therefore deliberately lazy — a slow timer plus a check
+/// whenever the user comes back to the window, which is when they would act.
 async function watchGame() {
-  if (state.busy || !state.data) return;
+  if (state.busy || !state.data || document.hidden) return;
   try {
     const running = await invoke("game_status");
     const was = state.data.game_running.length > 0;
@@ -387,6 +387,7 @@ async function watchGame() {
   }
 }
 
-setInterval(watchGame, 3000);
+setInterval(watchGame, 30000);
+window.addEventListener("focus", watchGame);
 
 load().catch((e) => banner(String(e), "error"));

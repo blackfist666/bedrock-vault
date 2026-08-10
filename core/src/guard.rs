@@ -2,8 +2,11 @@
 //!
 //! Copying a world's `db/` LevelDB while the game has it open produces a
 //! corrupt copy, so every destructive vault operation checks this first.
-
-use std::process::Command;
+//!
+//! The check asks Windows for the process list directly. It must never shell
+//! out to `tasklist`: spawning a console program from a GUI app flashes a
+//! console window and steals focus, which is intolerable for something the UI
+//! polls in the background.
 
 /// Any running process whose image name contains this is treated as the game.
 ///
@@ -36,32 +39,51 @@ pub fn game_status() -> GameStatus {
     GameStatus { running }
 }
 
-/// Every running process image name, or an empty list if the query fails.
+/// Every running process image name, via the Toolhelp snapshot API.
 ///
-/// One `tasklist` call rather than one per candidate name: it is ~100ms, and
-/// this runs on a UI poll.
+/// No child process, no window, ~1ms.
 #[cfg(windows)]
 fn running_processes() -> Vec<String> {
-    let Ok(out) = Command::new("tasklist").args(["/NH", "/FO", "CSV"]).output() else {
-        return Vec::new();
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
     };
-    // Rows look like: "name.exe","1234","Console","1","12,345 K"
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix('"'))
-        .filter_map(|rest| rest.split('"').next())
-        .map(str::to_owned)
-        .filter(|s| !s.is_empty())
-        .collect()
+
+    let mut names = Vec::new();
+    // SAFETY: the snapshot handle is checked before use and closed on every
+    // path; PROCESSENTRY32W is zeroed and given its required dwSize.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return names;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                names.push(String::from_utf16_lossy(&entry.szExeFile[..end]));
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    names
 }
 
 #[cfg(not(windows))]
 fn running_processes() -> Vec<String> {
-    let _ = Command::new("true");
     Vec::new()
 }
 
 /// Refuse an operation while the game is open.
+///
+/// Every destructive operation calls this, so safety does not depend on how
+/// often the UI polls — the poll only drives the on-screen warning.
 pub fn ensure_closed() -> anyhow::Result<()> {
     let status = game_status();
     if status.is_running() {
@@ -88,7 +110,7 @@ mod tests {
         let processes = running_processes();
         assert!(
             !processes.is_empty(),
-            "tasklist returned nothing — the process guard cannot work"
+            "process snapshot returned nothing — the process guard cannot work"
         );
         assert!(
             processes.iter().any(|p| p.to_lowercase() == my_name),
