@@ -50,6 +50,27 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
+    /// List the backups a Realm holds
+    RealmBackups {
+        /// Realm id shown by `realms`
+        realm: i64,
+    },
+    /// Download a Realm's world into the vault
+    RealmDownload {
+        /// Realm id shown by `realms`
+        realm: i64,
+        /// Slot to pull; defaults to the Realm's active slot
+        #[arg(long)]
+        slot: Option<i64>,
+        /// A specific backup id from `realm-backups`; defaults to the latest
+        #[arg(long)]
+        backup: Option<String>,
+    },
+    /// Read any Realms API path (GET only) — for exploring an undocumented API
+    Api {
+        /// Path such as /worlds/12345 or /worlds/12345/backups
+        path: String,
+    },
     /// Show where the vault lives
     Where,
     /// Move the vault to another folder (or adopt a vault already there)
@@ -124,6 +145,15 @@ fn main() -> Result<()> {
         }
         Cmd::Account { refresh, raw } => cmd_account(refresh, raw),
         Cmd::Realms { raw } => cmd_realms(raw),
+        Cmd::RealmBackups { realm } => cmd_realm_backups(realm),
+        Cmd::RealmDownload { realm, slot, backup } => {
+            cmd_realm_download(vault_root, realm, slot, backup.as_deref())
+        }
+        Cmd::Api { path } => {
+            let session = realms_session()?;
+            println!("{}", serde_json::to_string_pretty(&realms::get(&session, &path)?)?);
+            Ok(())
+        }
         Cmd::Where => {
             let root = vault_root.clone().unwrap_or_else(config::vault_root);
             println!("Vault:  {}", root.display());
@@ -366,6 +396,75 @@ fn cmd_realms(raw: bool) -> Result<()> {
     if realms.iter().any(|r| r.owner == Some(false)) {
         println!("Only a Realm's owner can replace its world, so uploads will be limited to yours.");
     }
+    Ok(())
+}
+
+fn cmd_realm_backups(realm: i64) -> Result<()> {
+    let session = realms_session()?;
+    let backups = realms::backups(&session, realm)?;
+    if backups.is_empty() {
+        println!("This Realm has no stored backups.");
+        return Ok(());
+    }
+    println!("{:<38} {:<17} {:>9}  WORLD", "BACKUP ID", "WHEN", "SIZE");
+    for b in &backups {
+        println!(
+            "{:<38} {:<17} {:>9}  {}{}",
+            b.backup_id,
+            fmt_time(b.last_modified),
+            human_size(b.size_bytes),
+            b.world_name.as_deref().unwrap_or("?"),
+            b.game_version
+                .as_deref()
+                .map(|v| format!(" (v{v})"))
+                .unwrap_or_default(),
+        );
+    }
+    println!("\n{} backup(s).", backups.len());
+    Ok(())
+}
+
+fn cmd_realm_download(
+    root: Option<PathBuf>,
+    realm_id: i64,
+    slot: Option<i64>,
+    backup: Option<&str>,
+) -> Result<()> {
+    let vault = open_vault(root)?;
+    let session = realms_session()?;
+
+    // Default to whichever slot the Realm currently has live.
+    let realm = realms::list(&session)?
+        .into_iter()
+        .find(|r| r.id == realm_id)
+        .with_context(|| format!("no Realm with id {realm_id} on this account"))?;
+    let slot = slot
+        .or(realm.active_slot)
+        .context("could not tell which slot to download; pass --slot")?;
+
+    println!("Asking for \"{}\" slot {slot}…", realm.name);
+    let download = realms::slot_download(&session, realm_id, slot, backup)?;
+    println!("Downloading {}…", human_size(download.size_bytes));
+
+    let temp = vault.root.join("exports").join(format!("realm-{realm_id}-slot{slot}.mcworld"));
+    let mut last_shown = 0u64;
+    let written = realms::fetch_world(&download, &temp, |done, total| {
+        // Only report every megabyte, so a fast download does not spam.
+        if done - last_shown > 1024 * 1024 || done == total {
+            last_shown = done;
+            println!("  {} of {}", human_size(done), human_size(total));
+        }
+    })?;
+    println!("Downloaded {}.", human_size(written));
+
+    let entry = vault.import_mcworld(&temp, &stamp())?;
+    std::fs::remove_file(&temp).ok();
+    println!(
+        "Added \"{}\" to the vault as {} ({}).",
+        entry.name,
+        entry.id,
+        human_size(entry.size_bytes)
+    );
     Ok(())
 }
 

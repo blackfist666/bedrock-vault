@@ -12,7 +12,7 @@
 pub mod auth;
 pub mod cache;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
 use crate::scan;
@@ -177,6 +177,144 @@ fn realm_from_as(v: &serde_json::Value, my_xuid: Option<&str>) -> Realm {
     }
 }
 
+/// One stored backup of a Realm slot.
+#[derive(Debug, Clone, Serialize)]
+pub struct RealmBackup {
+    pub backup_id: String,
+    /// Unix seconds (the service reports milliseconds).
+    pub last_modified: i64,
+    pub size_bytes: u64,
+    pub world_name: Option<String>,
+    pub game_mode: Option<String>,
+    pub difficulty: Option<String>,
+    pub game_version: Option<String>,
+}
+
+/// Where to fetch a slot's world from, and the token that authorises it.
+#[derive(Debug, Clone)]
+pub struct SlotDownload {
+    pub url: String,
+    pub token: String,
+    pub size_bytes: u64,
+}
+
+/// Backups the service holds for a Realm, newest first.
+pub fn backups(session: &auth::XstsToken, realm_id: i64) -> Result<Vec<RealmBackup>> {
+    let body = request(session, "GET", &format!("/worlds/{realm_id}/backups"))?;
+    let list = body["backups"]
+        .as_array()
+        .context("the Realms service did not return a backup list")?;
+    let mut out: Vec<RealmBackup> = list
+        .iter()
+        .map(|b| {
+            let meta = &b["metadata"];
+            RealmBackup {
+                backup_id: b["backupId"].as_str().unwrap_or_default().to_owned(),
+                last_modified: b["lastModifiedDate"].as_i64().unwrap_or(0) / 1000,
+                size_bytes: b["size"].as_u64().unwrap_or(0),
+                world_name: non_empty(meta["name"].as_str()),
+                game_mode: non_empty(meta["game_mode"].as_str()),
+                difficulty: non_empty(meta["game_difficulty"].as_str()),
+                game_version: non_empty(meta["game_server_version"].as_str()),
+            }
+        })
+        .collect();
+    out.sort_by_key(|b| std::cmp::Reverse(b.last_modified));
+    Ok(out)
+}
+
+fn non_empty(s: Option<&str>) -> Option<String> {
+    s.filter(|v| !v.is_empty()).map(str::to_owned)
+}
+
+/// Ask where a slot's world can be downloaded from.
+///
+/// `backup_id` picks a specific stored backup; `None` means the slot as it
+/// stands now.
+pub fn slot_download(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    slot: i64,
+    backup_id: Option<&str>,
+) -> Result<SlotDownload> {
+    let which = backup_id.unwrap_or("latest");
+    let body = request(
+        session,
+        "GET",
+        &format!("/archive/download/world/{realm_id}/{slot}/{which}"),
+    )?;
+    Ok(SlotDownload {
+        url: body["downloadUrl"]
+            .as_str()
+            .context("the service did not return a download address")?
+            .to_owned(),
+        token: body["token"].as_str().unwrap_or_default().to_owned(),
+        size_bytes: body["size"].as_u64().unwrap_or(0),
+    })
+}
+
+/// Stream a slot's world to disk as a `.mcworld`.
+///
+/// The content host is separate from the Realms API and takes the signed token
+/// from [`slot_download`] rather than the Xbox credential.
+pub fn fetch_world(
+    download: &SlotDownload,
+    dest: &std::path::Path,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<u64> {
+    let mut request = ureq::get(&download.url).set("User-Agent", "MCPE/UWP");
+    if !download.token.is_empty() {
+        request = request.set("Authorization", &format!("Bearer {}", download.token));
+    }
+
+    let response = request.call().map_err(|e| match e {
+        ureq::Error::Status(code, resp) => {
+            let detail: String = resp.into_string().unwrap_or_default().chars().take(300).collect();
+            anyhow!("the download failed with HTTP {code}: {detail}")
+        }
+        ureq::Error::Transport(t) => anyhow!("could not reach the download server: {t}"),
+    })?;
+
+    let expected = response
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(download.size_bytes);
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut reader = response.into_reader();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut file, &buffer[..n])?;
+        written += n as u64;
+        on_progress(written, expected);
+    }
+    std::io::Write::flush(&mut file)?;
+
+    if written == 0 {
+        std::fs::remove_file(dest).ok();
+        bail!("the download was empty");
+    }
+    Ok(written)
+}
+
+/// An authenticated **GET** against any Realms path.
+///
+/// The API is unofficial and undocumented, so exploring it against a live
+/// account is how its shape gets established. Restricted to GET so probing can
+/// never change anything on Mojang's side.
+pub fn get(session: &auth::XstsToken, path: &str) -> Result<serde_json::Value> {
+    request(session, "GET", path)
+}
+
 /// One authenticated call to the Realms service.
 fn request(session: &auth::XstsToken, method: &str, path: &str) -> Result<serde_json::Value> {
     let url = format!("{REALMS_BASE}{path}");
@@ -190,17 +328,28 @@ fn request(session: &auth::XstsToken, method: &str, path: &str) -> Result<serde_
     match response {
         Ok(ok) => ok.into_json().context("reading the Realms response"),
         Err(ureq::Error::Status(code, resp)) => {
-            let detail = resp.into_string().unwrap_or_default();
-            let detail: String = detail.chars().take(400).collect();
+            let body = resp.into_string().unwrap_or_default();
+            // The service wraps its reason in {"errorCode":..,"errorMsg":".."}.
+            let reason = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["errorMsg"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| body.chars().take(300).collect());
             Err(match code {
-                401 | 403 => anyhow!(
-                    "Realms refused the sign-in (HTTP {code}). Signing out and back in usually fixes it. {detail}"
+                401 => anyhow!(
+                    "Realms would not accept the sign-in. Signing out and back in usually fixes it. ({reason})"
                 ),
+                // Authenticated but not allowed: on a Realm you have only
+                // joined, downloading and uploading are the owner's alone.
+                403 => anyhow!(
+                    "Minecraft would not allow that — only a Realm's owner can download or replace its world. ({reason})"
+                ),
+                404 => anyhow!("Realms has no such Realm, slot or backup. ({reason})"),
                 426 => anyhow!(
-                    "Realms says this client version is too old — the version sent was {}. {detail}",
+                    "Realms says this client version is too old — the version sent was {}. ({reason})",
                     client_version()
                 ),
-                _ => anyhow!("Realms returned HTTP {code}: {detail}"),
+                503 => anyhow!("Realms is busy or unavailable right now. ({reason})"),
+                _ => anyhow!("Realms returned HTTP {code}: {reason}"),
             })
         }
         Err(ureq::Error::Transport(t)) => Err(anyhow!("could not reach Realms: {t}")),

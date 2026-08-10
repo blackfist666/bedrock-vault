@@ -268,6 +268,20 @@ function realmRows() {
   rows.push(head);
 
   for (const realm of r.realms.filter((x) => matches(x.name))) {
+    const actions = [];
+    if (realm.can_download) {
+      actions.push(button("Copy to vault", {
+        className: "green",
+        help: "Download this Realm's world into your vault. Nothing on the Realm is changed.",
+        onClick: () => confirmRun(
+          `Copy "${realm.name}" into your vault?`,
+          "The Realm's current world is downloaded and added to your vault as a new world. " +
+          "Nothing on the Realm itself is touched or changed.",
+          "Yes, copy it", "realm_download",
+          { realmId: realm.id, slot: realm.active_slot, name: realm.name }),
+      }));
+    }
+
     rows.push(worldRow({
       icon: null,
       name: realm.name,
@@ -277,8 +291,9 @@ function realmRows() {
         { text: realm.role === "yours" ? "Yours" : realm.role === "joined" ? "Joined" : "Owner unknown",
           kind: realm.role === "yours" ? "live" : "" },
       ],
-      meta: `Slot ${realm.active_slot ?? "?"} · up to ${realm.max_players ?? "?"} players`,
-      actions: [],
+      meta: `Slot ${realm.active_slot ?? "?"} · up to ${realm.max_players ?? "?"} players` +
+        (realm.can_download ? "" : " · only the owner can copy this world"),
+      actions,
     }));
   }
 
@@ -401,7 +416,7 @@ async function run(cmd, args) {
     play: "Getting it ready", back_up: "Backing up", export: "Making a copy",
     restore: "Restoring", delete: "Deleting", import: "Importing",
     set_vault_location: "Moving the vault", open_folder: "Opening",
-    realms_sign_out: "Signing out",
+    realms_sign_out: "Signing out", realm_download: "Downloading from the Realm",
   }[cmd] || "Working";
   showProgress(`${label}…`, 0, 0);
   try {
@@ -510,7 +525,8 @@ document.getElementById("change-location").addEventListener("click", async () =>
 
 listen("progress", (event) => {
   const { done, total, current } = event.payload;
-  showProgress(current ? `Saving "${current}"…` : "Finishing…", done, total);
+  const verb = state.section === "realms" ? "Downloading" : "Saving";
+  showProgress(current ? `${verb} "${current}"…` : "Finishing…", done, total);
 });
 
 /// Watch for Minecraft opening or closing. Only drives the on-screen warning:

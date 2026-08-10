@@ -488,6 +488,8 @@ struct RealmDto {
     max_players: Option<i64>,
     /// "yours", "joined", or "?" when it cannot be determined.
     role: &'static str,
+    /// Only a Realm's owner may download or replace its world.
+    can_download: bool,
 }
 
 #[derive(Serialize)]
@@ -544,6 +546,7 @@ async fn realms_overview() -> Result<RealmsDto, String> {
                     .map(|r| RealmDto {
                         subscription: r.subscription(),
                         role: r.role(),
+                        can_download: r.owner == Some(true),
                         id: r.id,
                         name: r.name,
                         state: r.state,
@@ -604,6 +607,60 @@ async fn realms_poll_login(
 async fn realms_cancel_login(pending: tauri::State<'_, PendingLogin>) -> Result<(), String> {
     *pending.0.lock().map_err(|_| "sign-in state was poisoned")? = None;
     Ok(())
+}
+
+/// Pull a Realm slot's world into the vault. Read-only on Mojang's side.
+#[tauri::command]
+async fn realm_download(
+    app: tauri::AppHandle,
+    realm_id: i64,
+    slot: Option<i64>,
+    name: String,
+) -> Result<String, String> {
+    blocking(move || {
+        let vault = open_vault()?;
+        let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
+
+        let slot = match slot {
+            Some(s) => s,
+            None => realms::list(&session)
+                .map_err(|e| format!("{e:#}"))?
+                .into_iter()
+                .find(|r| r.id == realm_id)
+                .and_then(|r| r.active_slot)
+                .ok_or("could not tell which slot to download")?,
+        };
+
+        let download = realms::slot_download(&session, realm_id, slot, None)
+            .map_err(|e| format!("{e:#}"))?;
+
+        let temp = vault
+            .exports_dir()
+            .join(format!("realm-{realm_id}-slot{slot}.mcworld"));
+        let mut last = 0u64;
+        realms::fetch_world(&download, &temp, |done, total| {
+            // Report per megabyte: an event per 64 KB chunk would flood the UI.
+            if done - last > 1024 * 1024 || done >= total {
+                last = done;
+                let _ = app.emit(
+                    "progress",
+                    ProgressDto {
+                        done: (done / 1024 / 1024) as usize,
+                        total: (total / 1024 / 1024).max(1) as usize,
+                        current: name.clone(),
+                    },
+                );
+            }
+        })
+        .map_err(|e| format!("{e:#}"))?;
+
+        let entry = vault
+            .import_mcworld(&temp, &stamp())
+            .map_err(|e| format!("{e:#}"))?;
+        std::fs::remove_file(&temp).ok();
+        Ok(format!("\"{}\" is now in your vault", entry.name))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -696,7 +753,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
             restore, import, export, open_folder, set_vault_location, realms_overview,
-            realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out, open_url
+            realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out,
+            realm_download, open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");
