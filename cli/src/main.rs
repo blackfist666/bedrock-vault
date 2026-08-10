@@ -87,6 +87,13 @@ enum Cmd {
         #[arg(long)]
         skip_close: bool,
     },
+    /// Rename the world in a Realm slot
+    RealmName {
+        realm: i64,
+        #[arg(long)]
+        slot: Option<i64>,
+        name: String,
+    },
     /// Close a Realm (players are disconnected until it is opened again)
     RealmClose { realm: i64 },
     /// Open a Realm again
@@ -184,6 +191,19 @@ fn main() -> Result<()> {
         }
         Cmd::RealmUpload { realm, id, slot, yes, skip_close } => {
             cmd_realm_upload(vault_root, realm, &id, slot, yes, !skip_close)
+        }
+        Cmd::RealmName { realm, slot, name } => {
+            let session = realms_session()?;
+            let slot = match slot {
+                Some(s) => s,
+                None => realms::detail(&session, realm)?
+                    .realm
+                    .active_slot
+                    .context("could not tell which slot; pass --slot")?,
+            };
+            realms::set_slot_name(&session, realm, slot, &name)?;
+            println!("Slot {slot} is now called \"{name}\".");
+            Ok(())
         }
         Cmd::RealmClose { realm } => {
             realms::close(&realms_session()?, realm)?;

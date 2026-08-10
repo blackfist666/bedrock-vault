@@ -656,31 +656,14 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
         let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
         let detail = realms::detail(&session, realm_id).map_err(|e| format!("{e:#}"))?;
         let known = known_packs();
+        let by_seed = worlds_by_seed();
 
         let slots: Vec<SlotDto> = detail
             .slots
             .into_iter()
             .map(|s| SlotDto {
                 name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
-                packs: s
-                    .pack_ids
-                    .iter()
-                    .map(|id| match known.get(&id.replace('-', "")) {
-                        Some(p) => PackRefDto {
-                            name: p.0.clone(),
-                            icon: p.1.clone(),
-                            installed: true,
-                        },
-                        // The Realm gives an id with no name anywhere on this
-                        // PC. Saying "not installed" was wrong — it says
-                        // nothing about whether the account owns it.
-                        None => PackRefDto {
-                            name: "Add-on".to_owned(),
-                            icon: None,
-                            installed: false,
-                        },
-                    })
-                    .collect(),
+                packs: name_slot_packs(&s, &known, &by_seed),
                 rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
                 slot_id: s.slot_id,
                 game_mode: s.game_mode,
@@ -716,6 +699,77 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
     })
     .await
+}
+
+/// World seed -> a copy of that world held here.
+///
+/// A Realm slot reports its seed, which identifies which world is on it far
+/// more reliably than a name that anyone can change.
+fn worlds_by_seed() -> HashMap<String, PathBuf> {
+    let mut index = HashMap::new();
+    let mut note = |dir: PathBuf| {
+        if let Some(seed) = std::fs::read(dir.join("level.dat"))
+            .ok()
+            .and_then(|d| bedrock_vault_core::level_dat::parse(&d).ok())
+            .and_then(|m| m.seed)
+        {
+            index.entry(seed.to_string()).or_insert(dir);
+        }
+    };
+    if let Ok(vault) = open_vault() {
+        for e in vault.list().unwrap_or_default() {
+            note(e.world_dir);
+        }
+    }
+    if let Ok(locations) = scan::find_worlds_dirs() {
+        for loc in locations.iter().filter(|l| l.path.is_dir()) {
+            for w in scan::scan(&loc.path).unwrap_or_default() {
+                note(loc.path.join(&w.folder));
+            }
+        }
+    }
+    index
+}
+
+/// Put names to a slot's add-ons.
+///
+/// Realms mints its own ids for packs attached to a slot; they appear nowhere
+/// locally and no endpoint resolves them. But if a copy of that world is held
+/// here — matched on the seed the slot reports — the world's own pack history
+/// names them, and their order matches the slot's. Where that fails, the kind
+/// of pack is still known, so it says "Resource pack" rather than pretending.
+fn name_slot_packs(
+    slot: &realms::Slot,
+    known: &HashMap<String, (String, Option<String>)>,
+    by_seed: &HashMap<String, PathBuf>,
+) -> Vec<PackRefDto> {
+    let from_world: Vec<String> = slot
+        .seed
+        .as_ref()
+        .and_then(|seed| by_seed.get(seed))
+        .map(|dir| {
+            let mut names: Vec<String> = packs::names_from_history(dir)
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect();
+            names.dedup();
+            names
+        })
+        .unwrap_or_default();
+
+    slot.pack_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            if let Some(p) = known.get(&id.replace('-', "")) {
+                return PackRefDto { name: p.0.clone(), icon: p.1.clone(), installed: true };
+            }
+            match from_world.get(i).or_else(|| from_world.first()) {
+                Some(name) => PackRefDto { name: name.clone(), icon: None, installed: true },
+                None => PackRefDto { name: "Add-on".to_owned(), icon: None, installed: false },
+            }
+        })
+        .collect()
 }
 
 /// uuid (dashless) -> (name, icon) for every pack this PC can name.
@@ -932,6 +986,32 @@ async fn realm_download(
     .await
 }
 
+/// Rename the world in a Realm slot.
+#[tauri::command]
+async fn realm_rename_slot(realm_id: i64, slot: i64, name: String) -> Result<String, String> {
+    blocking(move || {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err("give the world a name".into());
+        }
+        let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
+        realms::set_slot_name(&session, realm_id, slot, &name).map_err(|e| format!("{e:#}"))?;
+        Ok(format!("The world on slot {slot} is now called \"{name}\""))
+    })
+    .await
+}
+
+/// Turn off every add-on on a Realm slot.
+#[tauri::command]
+async fn realm_clear_packs(realm_id: i64, slot: i64) -> Result<String, String> {
+    blocking(move || {
+        let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
+        realms::clear_slot_packs(&session, realm_id, slot).map_err(|e| format!("{e:#}"))?;
+        Ok(format!("Add-ons turned off on slot {slot}"))
+    })
+    .await
+}
+
 /// Realms this account may push a world onto: owned and still subscribed.
 #[tauri::command]
 async fn realm_targets() -> Result<Vec<RealmDto>, String> {
@@ -1109,8 +1189,8 @@ fn main() {
             overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
             restore, import, export, open_folder, set_vault_location, realms_overview,
             realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out,
-            realm_download, realm_detail, realm_targets, realm_upload, packs_overview, profile,
-            open_url
+            realm_download, realm_detail, realm_targets, realm_upload, realm_rename_slot,
+            realm_clear_packs, packs_overview, profile, open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");

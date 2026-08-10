@@ -154,6 +154,11 @@ fn read_name_file(dir: &Path) -> Option<String> {
 }
 
 /// A world's name, from `level.dat` with `levelname.txt` as the fallback.
+pub fn world_display_name(world_dir: &Path) -> Option<String> {
+    world_name(world_dir)
+}
+
+/// A world's name, from `level.dat` with `levelname.txt` as the fallback.
 fn world_name(world_dir: &Path) -> Option<String> {
     fs::read(world_dir.join("level.dat"))
         .ok()

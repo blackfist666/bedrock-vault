@@ -307,6 +307,31 @@ function realmHero(realm) {
         slot.rules.map(([k, v]) => `${k}: ${v}`).join(" · ")));
     }
     if (slot.seed) s.append(el("div", "slot-rules", `Seed ${slot.seed}`));
+
+    if (realm.can_download) {
+      const slotActions = el("div", "row-actions");
+      slotActions.append(button("Rename", {
+        help: "Change the world's name as shown in Minecraft.",
+        onClick: () => askText(
+          `Rename the world on slot ${slot.slot_id}`,
+          "This is the name Minecraft shows for the world on this Realm.",
+          slot.name === "Unnamed world" ? "" : slot.name,
+          (name) => run("realm_rename_slot", { realmId: realm.id, slot: slot.slot_id, name })),
+      }));
+      if (slot.packs.length) {
+        slotActions.append(button("Turn off add-ons", {
+          className: "red",
+          help: "Remove every add-on from this world on the Realm.",
+          onClick: () => confirmRun(
+            `Turn off the add-ons on slot ${slot.slot_id}?`,
+            "The world keeps everything already built with them, but the add-ons stop being applied. " +
+            "You can put them back from inside Minecraft.",
+            "Yes, turn them off", "realm_clear_packs",
+            { realmId: realm.id, slot: slot.slot_id }),
+        }));
+      }
+      s.append(slotActions);
+    }
     slots.append(s);
   }
   card.append(slots);
@@ -676,7 +701,8 @@ async function run(cmd, args) {
     restore: "Restoring", delete: "Deleting", import: "Importing",
     set_vault_location: "Moving the vault", open_folder: "Opening",
     realms_sign_out: "Signing out", realm_download: "Downloading from the Realm",
-    realm_upload: "Sending to the Realm",
+    realm_upload: "Sending to the Realm", realm_rename_slot: "Renaming",
+    realm_clear_packs: "Updating the Realm",
   }[cmd] || "Working";
   showProgress(`${label}…`, 0, 0);
   try {
@@ -689,7 +715,7 @@ async function run(cmd, args) {
       await loadRealms();
     } else {
       await load();
-      if (cmd === "realm_download" || cmd === "realm_upload") await loadRealms();
+      if (cmd.startsWith("realm_")) await loadRealms();
     }
     if (message) banner(message, "ok");
   } catch (e) {
@@ -699,6 +725,46 @@ async function run(cmd, args) {
     hideProgress();
     if (state.data) render();
   }
+}
+
+/// Ask for a line of text, in the app's own dialog.
+function askText(title, body, initial, onDone) {
+  const modal = document.getElementById("modal");
+  document.getElementById("modal-title").textContent = title;
+  document.getElementById("modal-body").textContent = body;
+  const ok = document.getElementById("modal-ok");
+  const cancel = document.getElementById("modal-cancel");
+  ok.textContent = "Save";
+  ok.style.display = "";
+
+  const field = el("input", "text-field");
+  field.type = "text";
+  field.value = initial || "";
+  field.maxLength = 64;
+  const box = document.querySelector(".modal-actions");
+  box.parentElement.insertBefore(field, box);
+
+  const close = () => {
+    modal.className = "modal hidden";
+    field.remove();
+    ok.onclick = null;
+    cancel.onclick = null;
+    document.onkeydown = null;
+  };
+  const submit = () => {
+    const value = field.value.trim();
+    close();
+    if (value) onDone(value);
+  };
+  ok.onclick = submit;
+  cancel.onclick = close;
+  document.onkeydown = (e) => {
+    if (e.key === "Escape") close();
+    if (e.key === "Enter") submit();
+  };
+  modal.className = "modal";
+  field.focus();
+  field.select();
 }
 
 /// Pick which vault world to put on a Realm.

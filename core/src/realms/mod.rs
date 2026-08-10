@@ -717,7 +717,133 @@ pub fn replace_slot_world(
             "the world uploaded, but the Realm could not be reopened — open it from the game",
         );
     }
+
+    // Cosmetic, and never worth failing the upload over: the world is already
+    // on the Realm by this point.
+    on_step("Naming the world on the Realm");
+    let name = crate::vault::world_display_name(world_dir).unwrap_or_else(|| "World".to_owned());
+    let _ = describe_uploaded_slot(session, realm_id, slot, world_dir, &name);
+
     Ok(saved)
+}
+
+/// Send a JSON body to a Realms path. Used for slot settings.
+pub fn send_json(
+    session: &auth::XstsToken,
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let url = format!("{REALMS_BASE}{path}");
+    let response = ureq::request(method, &url)
+        .set("Authorization", &session.authorization())
+        .set("Client-Version", &client_version())
+        .set("User-Agent", "MCPE/UWP")
+        .set("Accept", "*/*")
+        .set("Content-Type", "application/json")
+        .send_json(body.clone());
+
+    match response {
+        Ok(ok) => Ok(ok.into_json().unwrap_or(serde_json::Value::Null)),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let reason = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v["errorMsg"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| text.chars().take(300).collect());
+            Err(anyhow!("HTTP {code}: {reason}"))
+        }
+        Err(ureq::Error::Transport(t)) => Err(anyhow!("could not reach Realms: {t}")),
+    }
+}
+
+/// The raw `options` object for one slot, exactly as the service holds it.
+///
+/// Slot settings are written back whole, so any change must start from the
+/// current values — writing a partial object would reset the game rules.
+pub fn slot_options(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    slot: i64,
+) -> Result<serde_json::Value> {
+    let body = request(session, "GET", &format!("/worlds/{realm_id}"))?;
+    let slots = body["slots"].as_array().context("the Realm reported no slots")?;
+    let found = slots
+        .iter()
+        .find(|s| s["slotId"].as_i64() == Some(slot))
+        .with_context(|| format!("the Realm has no slot {slot}"))?;
+    // `options` is a JSON document stored as a string.
+    found["options"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .context("could not read the slot's settings")
+}
+
+/// Write a slot's settings back, having started from [`slot_options`].
+pub fn set_slot_options(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    slot: i64,
+    options: &serde_json::Value,
+) -> Result<()> {
+    send_json(
+        session,
+        "POST",
+        &format!("/worlds/{realm_id}/slot/{slot}"),
+        options,
+    )
+    .map(|_| ())
+}
+
+/// Rename the world in a slot, leaving every other setting alone.
+pub fn set_slot_name(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    slot: i64,
+    name: &str,
+) -> Result<()> {
+    let mut options = slot_options(session, realm_id, slot)?;
+    options["slotName"] = serde_json::Value::String(name.to_owned());
+    set_slot_options(session, realm_id, slot, &options)
+}
+
+/// Turn off every add-on on a slot.
+pub fn clear_slot_packs(session: &auth::XstsToken, realm_id: i64, slot: i64) -> Result<()> {
+    let mut options = slot_options(session, realm_id, slot)?;
+    options["enabledPacks"] = serde_json::json!({ "resourcePacks": [], "behaviorPacks": [] });
+    set_slot_options(session, realm_id, slot, &options)
+}
+
+/// Name a slot after the world put on it, and declare the add-ons that world
+/// carries.
+///
+/// Without this an uploaded world shows as "Unnamed world" with anonymous
+/// add-ons: Realms keeps its own ids for packs attached in game, which appear
+/// nowhere locally and cannot be resolved to names. Declaring the world's own
+/// pack ids instead means the Realm afterwards reports ids this app *can* name,
+/// because the world itself records them.
+fn describe_uploaded_slot(
+    session: &auth::XstsToken,
+    realm_id: i64,
+    slot: i64,
+    world_dir: &std::path::Path,
+    name: &str,
+) -> Result<()> {
+    let mut options = slot_options(session, realm_id, slot)?;
+    options["slotName"] = serde_json::Value::String(name.to_owned());
+
+    let (resource, behavior) = crate::packs::world_pack_refs(world_dir);
+    let ids = |refs: Vec<crate::packs::PackRef>| -> Vec<serde_json::Value> {
+        refs.into_iter()
+            .map(|r| serde_json::Value::String(r.uuid.replace('-', "")))
+            .collect()
+    };
+    options["enabledPacks"] = serde_json::json!({
+        "resourcePacks": ids(resource),
+        "behaviorPacks": ids(behavior),
+    });
+
+    set_slot_options(session, realm_id, slot, &options)
 }
 
 /// GET any Xbox service with the Xbox Live credential.

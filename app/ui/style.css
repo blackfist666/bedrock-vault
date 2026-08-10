@@ -364,6 +364,19 @@ footer { padding: 4px 20px 20px; color: var(--muted); font-size: 12px; }
 .realm-choices.scroll { max-height: 46vh; overflow-y: auto; }
 .realm-choices .mc-btn { text-align: left; }
 
+.text-field {
+  width: 100%;
+  background: #131315;
+  border: 2px solid var(--edge);
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 15px;
+  margin-bottom: 18px;
+}
+
+.text-field:focus { outline: none; border-color: var(--green); }
+.slot .row-actions { margin-top: 4px; }
+
 /* Must be last and more specific than any rule that sets `display`, otherwise
    an element like .progress or .modal stays on screen when hidden. */
 .hidden,
