@@ -34,6 +34,71 @@ const EXPLAIN = {
   realms: "Your Realm and what is on it. Copy a Realm's world into your vault at any time.",
 };
 
+/// Wallpapers bundled with the app; one is picked at random each launch.
+const WALLPAPERS = [
+  "beach", "cherry", "fireplace", "mangrove_swamp", "snow", "warm_ocean",
+];
+
+function pickWallpaper() {
+  const choice = WALLPAPERS[Math.floor(Math.random() * WALLPAPERS.length)];
+  document.getElementById("wallpaper").style.backgroundImage =
+    `url("backgrounds/${choice}.jpg")`;
+}
+
+/// Ctrl+wheel and Ctrl+plus/minus scale the whole window, as in a browser.
+///
+/// Uses the CSS `zoom` property rather than a transform: it reflows the layout,
+/// so panels re-wrap to the window instead of being scaled and clipped. The
+/// chosen level is remembered between launches.
+const ZOOM = { min: 0.6, max: 2.0, step: 0.1, key: "bedrock-vault-zoom" };
+
+function applyZoom(level) {
+  const clamped = Math.min(ZOOM.max, Math.max(ZOOM.min, Math.round(level * 100) / 100));
+  document.body.style.zoom = clamped;
+  try {
+    localStorage.setItem(ZOOM.key, String(clamped));
+  } catch {
+    // Private mode or a locked-down webview: zoom still works this session.
+  }
+  return clamped;
+}
+
+function currentZoom() {
+  return parseFloat(document.body.style.zoom) || 1;
+}
+
+function nudgeZoom(direction) {
+  const level = applyZoom(currentZoom() + direction * ZOOM.step);
+  banner(level === 1 ? "Size reset" : `Size ${Math.round(level * 100)}%`, "ok");
+  clearTimeout(nudgeZoom.timer);
+  nudgeZoom.timer = setTimeout(() => {
+    // Do not sit on top of a real message.
+    const b = document.getElementById("banner");
+    if (b.textContent.startsWith("Size")) clearBanner();
+  }, 1200);
+}
+
+function setUpZoom() {
+  let saved = 1;
+  try {
+    saved = parseFloat(localStorage.getItem(ZOOM.key)) || 1;
+  } catch { /* fall back to 100% */ }
+  applyZoom(saved);
+
+  window.addEventListener("wheel", (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    nudgeZoom(e.deltaY < 0 ? 1 : -1);
+  }, { passive: false });
+
+  window.addEventListener("keydown", (e) => {
+    if (!e.ctrlKey) return;
+    if (e.key === "+" || e.key === "=") { e.preventDefault(); nudgeZoom(1); }
+    else if (e.key === "-") { e.preventDefault(); nudgeZoom(-1); }
+    else if (e.key === "0") { e.preventDefault(); applyZoom(1); nudgeZoom(0); }
+  });
+}
+
 function humanSize(bytes) {
   const units = ["B", "KB", "MB", "GB"];
   let v = bytes, u = 0;
@@ -1072,6 +1137,9 @@ async function watchGame() {
 
 setInterval(watchGame, 30000);
 window.addEventListener("focus", watchGame);
+
+pickWallpaper();
+setUpZoom();
 
 load()
   .then(loadProfile)
