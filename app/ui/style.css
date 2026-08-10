@@ -219,6 +219,16 @@ button.link:hover:not(:disabled) { color: var(--text); }
 }
 
 footer { padding: 4px 24px 24px; color: var(--muted); font-size: 12.5px; }
+
+.footer-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+
+.footer-row span { color: #7f8899; }
 .empty { padding: 36px 4px; color: var(--muted); font-size: 14px; }
 
 .modal {

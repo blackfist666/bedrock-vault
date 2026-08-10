@@ -246,6 +246,7 @@ async function run(cmd, args) {
     save_all: "Saving worlds", save_to_vault: "Saving to the vault", put_away: "Putting away",
     play: "Getting it ready", back_up: "Backing up", export: "Making a copy",
     restore: "Restoring", delete: "Deleting", import: "Importing",
+    set_vault_location: "Moving the vault", open_folder: "Opening",
   }[cmd] || "Working";
   showProgress(`${label}…`, 0, 0);
   try {
@@ -308,7 +309,8 @@ async function load() {
 
   document.getElementById("footer").textContent =
     `Minecraft ${humanSize(data.live_bytes)} · Vault ${humanSize(data.vault_bytes)} · ` +
-    `Backups ${humanSize(data.backup_bytes)} · Stored in ${data.vault_root}`;
+    `Backups ${humanSize(data.backup_bytes)}`;
+  document.getElementById("vault-path").textContent = `Vault folder: ${data.vault_root}`;
 
   if (data.game_running.length) {
     banner("Minecraft is open. Close the game before moving worlds around, so nothing gets damaged.", "");
@@ -332,6 +334,24 @@ document.querySelectorAll(".step").forEach((step) => {
 document.getElementById("search").addEventListener("input", (e) => {
   state.search = e.target.value;
   render();
+});
+
+document.getElementById("open-vault").addEventListener("click", () => run("open_folder", { which: "root" }));
+
+document.getElementById("change-location").addEventListener("click", async () => {
+  try {
+    const folder = await openDialog({ directory: true, multiple: false });
+    if (!folder) return;
+    const path = typeof folder === "string" ? folder : folder.path;
+    confirmRun(
+      "Move the vault here?",
+      `Everything in the vault — worlds and backups — will be moved to ${path}. ` +
+      "The old copy is only removed once every file has arrived safely. " +
+      "If that folder already holds a vault, the app will just start using it instead.",
+      "Yes, use this folder", "set_vault_location", { path });
+  } catch (e) {
+    banner(String(e), "error");
+  }
 });
 
 listen("progress", (event) => {

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bedrock_vault_core::{
-    guard, packs, scan,
-    vault::{Protection, Vault},
+    config, guard, packs, scan,
+    vault::{self, Protection, Vault},
 };
 use chrono::Local;
 use serde::Serialize;
@@ -101,7 +101,7 @@ struct OverviewDto {
 }
 
 fn vault_root() -> PathBuf {
-    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into())).join("BedrockVault")
+    config::vault_root()
 }
 
 fn stamp() -> String {
@@ -453,6 +453,50 @@ async fn export(id: String) -> Result<String, String> {
     .await
 }
 
+/// Move the vault to a new folder, or adopt a vault that is already there.
+///
+/// An empty destination gets the current vault moved into it; a folder that
+/// already holds a vault is simply adopted, so a vault on a shared drive can be
+/// picked up on another PC.
+#[tauri::command]
+async fn set_vault_location(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    blocking(move || {
+        let dest = PathBuf::from(&path);
+        let current = vault_root();
+        if dest == current {
+            return Ok("That is already where the vault lives".to_owned());
+        }
+
+        if vault::looks_like_vault(&dest) {
+            config::set_vault_root(&dest).map_err(|e| format!("{e:#}"))?;
+            return Ok(format!("Now using the vault already in {}", dest.display()));
+        }
+
+        if !vault::is_empty_dir(&dest) {
+            return Err(format!(
+                "{} already has files in it. Pick an empty folder, or one that already holds a vault.",
+                dest.display()
+            ));
+        }
+
+        if vault::looks_like_vault(&current) {
+            let moved = vault::move_vault(&current, &dest, |done, total| {
+                let _ = app.emit(
+                    "progress",
+                    ProgressDto { done: done as usize, total: total as usize, current: String::new() },
+                );
+            })
+            .map_err(|e| format!("{e:#}"))?;
+            config::set_vault_root(&dest).map_err(|e| format!("{e:#}"))?;
+            return Ok(format!("Moved {moved} files to {}", dest.display()));
+        }
+
+        config::set_vault_root(&dest).map_err(|e| format!("{e:#}"))?;
+        Ok(format!("The vault is now at {}", dest.display()))
+    })
+    .await
+}
+
 /// Open a vault sub-folder in Explorer.
 #[tauri::command]
 async fn open_folder(which: String) -> Result<String, String> {
@@ -474,7 +518,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
-            restore, import, export, open_folder
+            restore, import, export, open_folder, set_vault_location
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");

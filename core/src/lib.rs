@@ -1,6 +1,7 @@
 //! Bedrock Vault core: world discovery, metadata, packaging, and the vault
 //! operations (backup / archive / activate) shared by the CLI and the app.
 
+pub mod config;
 pub mod guard;
 pub mod level_dat;
 pub mod mcworld;

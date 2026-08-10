@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bedrock_vault_core::{
-    guard, level_dat, mcworld, packs, scan,
+    config, guard, level_dat, mcworld, packs, scan,
     vault::{Protection, Vault},
 };
 use chrono::{Local, TimeZone};
@@ -30,6 +30,13 @@ enum Cmd {
     Packs,
     /// Report whether Minecraft is running (world operations are blocked if so)
     Guard,
+    /// Show where the vault lives
+    Where,
+    /// Move the vault to another folder (or adopt a vault already there)
+    Move {
+        /// Destination folder
+        dest: PathBuf,
+    },
     /// List worlds held in the vault library
     Library,
     /// Copy a live world into the vault (or refresh its copy), keeping it in game
@@ -87,6 +94,21 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Where => {
+            let root = vault_root.clone().unwrap_or_else(config::vault_root);
+            println!("Vault:  {}", root.display());
+            println!("Config: {}", config::config_path()?.display());
+            println!(
+                "Status: {}",
+                if bedrock_vault_core::vault::looks_like_vault(&root) {
+                    "a vault is there"
+                } else {
+                    "no vault there yet (it will be created on first use)"
+                }
+            );
+            Ok(())
+        }
+        Cmd::Move { dest } => cmd_move(vault_root, &dest),
         Cmd::Library => cmd_library(vault_root),
         Cmd::Protect { world } => cmd_protect(vault_root, world.as_deref()),
         Cmd::Snapshots { id } => cmd_snapshots(vault_root, &id),
@@ -175,18 +197,45 @@ fn cmd_scan(dir: Option<PathBuf>) -> Result<()> {
 }
 
 fn open_vault(root: Option<PathBuf>) -> Result<Vault> {
-    let root = match root {
-        Some(r) => r,
-        None => PathBuf::from(std::env::var("USERPROFILE").context("USERPROFILE is not set")?)
-            .join("BedrockVault"),
-    };
-    Vault::open(root)
+    // --vault wins, otherwise whatever the app's config says.
+    Vault::open(root.unwrap_or_else(config::vault_root))
 }
 
 /// Vault ids and folder names are timestamp-based, so operations are ordered
 /// and readable on disk.
 fn stamp() -> String {
     Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+fn cmd_move(root: Option<PathBuf>, dest: &std::path::Path) -> Result<()> {
+    // An explicit --vault is a one-off override, so moving that vault must not
+    // repoint the app at it; only a move of the configured vault updates config.
+    let overridden = root.is_some();
+    let current = root.unwrap_or_else(config::vault_root);
+
+    if bedrock_vault_core::vault::looks_like_vault(dest) {
+        if overridden {
+            println!("A vault already exists at {} — nothing to do.", dest.display());
+        } else {
+            config::set_vault_root(dest)?;
+            println!("Now using the vault already at {}", dest.display());
+        }
+        return Ok(());
+    }
+
+    println!("Moving {} → {}", current.display(), dest.display());
+    let moved = bedrock_vault_core::vault::move_vault(&current, dest, |done, total| {
+        if done % 200 == 0 || done == total {
+            println!("  {done}/{total} files");
+        }
+    })?;
+    if overridden {
+        println!("Moved {moved} file(s) to {} (--vault given, so the app's own vault location is unchanged).", dest.display());
+    } else {
+        config::set_vault_root(dest)?;
+        println!("Moved {moved} file(s). The vault now lives at {}", dest.display());
+    }
+    Ok(())
 }
 
 fn cmd_library(root: Option<PathBuf>) -> Result<()> {

@@ -544,6 +544,72 @@ impl Vault {
     }
 }
 
+/// Whether a folder already holds a vault.
+pub fn looks_like_vault(root: &Path) -> bool {
+    root.join("library").is_dir()
+}
+
+/// Whether a folder is empty (or absent), and so safe to move a vault into.
+pub fn is_empty_dir(root: &Path) -> bool {
+    match fs::read_dir(root) {
+        Ok(mut entries) => entries.next().is_none(),
+        // A path that does not exist yet counts as empty.
+        Err(_) => !root.exists(),
+    }
+}
+
+/// Move an entire vault to a new location.
+///
+/// Copies everything, verifies it, and only then removes the original — so an
+/// interrupted move leaves the old vault intact. `on_file` reports progress.
+pub fn move_vault(from: &Path, to: &Path, mut on_file: impl FnMut(u64, u64)) -> Result<u64> {
+    if !looks_like_vault(from) {
+        bail!("{} does not look like a vault", from.display());
+    }
+    if from == to {
+        bail!("the vault is already there");
+    }
+    if !is_empty_dir(to) {
+        bail!("{} is not empty", to.display());
+    }
+
+    let total: u64 = walkdir::WalkDir::new(from)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count() as u64;
+
+    fs::create_dir_all(to)?;
+    let mut done = 0u64;
+    for entry in walkdir::WalkDir::new(from) {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(from).unwrap();
+        let target = to.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), &target)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+            done += 1;
+            on_file(done, total);
+        }
+    }
+
+    let (moved_files, _) = count_and_size(to);
+    let (source_files, _) = count_and_size(from);
+    if moved_files != source_files {
+        bail!(
+            "move verification failed: {source_files} files at the source, \
+             {moved_files} at the destination — the original has been left alone"
+        );
+    }
+    fs::remove_dir_all(from).with_context(|| format!("removing {}", from.display()))?;
+    Ok(done)
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -750,6 +816,49 @@ mod tests {
             "a deleted world's backups must still show its name"
         );
         assert!(groups[0].snapshots.len() >= 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_vault_relocates_everything_and_verifies() {
+        let base = temp("movevault");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let old_root = base.join("old");
+        let vault = Vault::open(&old_root).unwrap();
+        let entry = vault.protect(&live, "abc=", "20260810-1400").unwrap();
+
+        let new_root = base.join("new");
+        let moved = move_vault(&old_root, &new_root, |_, _| {}).unwrap();
+        assert!(moved > 0);
+        assert!(!old_root.exists(), "the old vault is removed after verifying");
+
+        let moved_vault = Vault::open(&new_root).unwrap();
+        let entries = moved_vault.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Spike Test World");
+        assert_eq!(entries[0].id, entry.id);
+        assert!(!moved_vault.snapshots(&entries[0]).is_empty(), "backups came too");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_vault_refuses_a_non_empty_destination() {
+        let base = temp("movebusy");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let old_root = base.join("old");
+        let vault = Vault::open(&old_root).unwrap();
+        vault.protect(&live, "abc=", "20260810-1400").unwrap();
+
+        let busy = base.join("busy");
+        fs::create_dir_all(&busy).unwrap();
+        fs::write(busy.join("something.txt"), b"in the way").unwrap();
+
+        assert!(move_vault(&old_root, &busy, |_, _| {}).is_err());
+        assert!(old_root.join("library").is_dir(), "source untouched on refusal");
 
         let _ = fs::remove_dir_all(&base);
     }

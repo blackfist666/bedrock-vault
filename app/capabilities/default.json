@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Main window: core APIs plus the file picker used by Import",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-message"]
 }
