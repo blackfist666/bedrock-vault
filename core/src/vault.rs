@@ -97,6 +97,13 @@ struct Meta {
     /// Cached because listing the library otherwise walks every file of every
     /// world, which makes a refresh after a bulk save look like a hang.
     size_bytes: Option<u64>,
+    /// Every `minecraftWorlds` folder id this world has ever occupied.
+    ///
+    /// Keeps its snapshot history together: archiving clears `origin_folder`,
+    /// and activating mints a new id, so without this a world's backups would
+    /// scatter into a fresh group each time it moved.
+    #[serde(default)]
+    past_folders: Vec<String>,
 }
 
 pub struct Vault {
@@ -118,6 +125,8 @@ pub struct LibraryEntry {
     pub synced_at: Option<i64>,
     /// `LastPlayed` of the source when this copy was taken.
     pub source_last_played: Option<i64>,
+    /// Every `minecraftWorlds` folder id this world has occupied.
+    pub past_folders: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +144,13 @@ pub struct BackupGroup {
     pub key: String,
     pub name: String,
     pub snapshots: Vec<Snapshot>,
+}
+
+fn read_name_file(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join("name.txt"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 /// A world's name, from `level.dat` with `levelname.txt` as the fallback.
@@ -243,6 +259,7 @@ impl Vault {
                 origin: meta.origin,
                 synced_at: meta.synced_at,
                 source_last_played: meta.source_last_played,
+                past_folders: meta.past_folders,
                 world_dir,
             });
         }
@@ -318,6 +335,9 @@ impl Vault {
 
         let mut meta = self.read_meta(&id);
         meta.origin_folder = Some(folder_id.to_owned());
+        if !meta.past_folders.iter().any(|f| f == folder_id) {
+            meta.past_folders.push(folder_id.to_owned());
+        }
         if meta.origin.is_empty() {
             meta.origin = "local".into();
         }
@@ -358,6 +378,9 @@ impl Vault {
         })?;
 
         let mut meta = self.read_meta(id);
+        if !meta.past_folders.contains(&folder_id) {
+            meta.past_folders.push(folder_id.clone());
+        }
         meta.origin_folder = Some(folder_id);
         meta.source_last_played = entry.last_played;
         self.write_meta(id, &meta)?;
@@ -409,6 +432,7 @@ impl Vault {
             source_last_played: entry.last_played,
             synced_at: Some(now()),
             size_bytes: Some(scan::dir_size(&entry.world_dir)),
+            past_folders: Vec::new(),
         };
         self.write_meta(id, &meta)?;
         self.entry(id)
@@ -445,54 +469,92 @@ impl Vault {
     /// All snapshots on disk, grouped per world, newest group first.
     ///
     /// `library` supplies current names; pass the list you already have.
+    ///
+    /// Snapshots of one world can be filed under two keys — Minecraft's folder
+    /// id for those taken before it was saved to the vault, and the vault id
+    /// after — so those are merged. Merging is by that explicit link and never
+    /// by name, since a player can easily have several worlds called
+    /// "My World" and combining their histories would be a lie.
     pub fn all_backups(&self, library: &[LibraryEntry]) -> Vec<BackupGroup> {
         let Ok(entries) = fs::read_dir(self.backups_dir()) else {
             return Vec::new();
         };
-        let live_names: std::collections::HashMap<&str, &str> = library
+        let names: std::collections::HashMap<&str, &str> =
+            library.iter().map(|e| (e.id.as_str(), e.name.as_str())).collect();
+        let alias: std::collections::HashMap<&str, &str> = library
             .iter()
-            .map(|e| (e.id.as_str(), e.name.as_str()))
-            .collect();
-
-        let mut groups: Vec<BackupGroup> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| {
-                let key = e.file_name().to_string_lossy().into_owned();
-                let snapshots = self.snapshots_for_key(&key);
-                if snapshots.is_empty() {
-                    return None;
-                }
-                let name = live_names
-                    .get(key.as_str())
-                    .map(|s| (*s).to_owned())
-                    .or_else(|| {
-                        fs::read_to_string(e.path().join("name.txt"))
-                            .ok()
-                            .map(|s| s.trim().to_owned())
-                            .filter(|s| !s.is_empty())
-                    })
-                    .unwrap_or_else(|| key.clone());
-                Some(BackupGroup { key, name, snapshots })
+            .flat_map(|e| {
+                e.past_folders
+                    .iter()
+                    .map(String::as_str)
+                    .chain(e.origin_folder.as_deref())
+                    .map(move |folder| (folder, e.id.as_str()))
             })
             .collect();
+
+        // group key -> (snapshots, directories they came from)
+        let mut merged: std::collections::HashMap<String, (Vec<Snapshot>, Vec<PathBuf>)> =
+            std::collections::HashMap::new();
+        for entry in entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
+            let key = entry.file_name().to_string_lossy().into_owned();
+            let snapshots = self.snapshots_for_key(&key);
+            if snapshots.is_empty() {
+                continue;
+            }
+            let group_key = alias.get(key.as_str()).map(|s| (*s).to_owned()).unwrap_or(key);
+            let slot = merged.entry(group_key).or_default();
+            slot.0.extend(snapshots);
+            slot.1.push(entry.path());
+        }
+
+        let mut groups: Vec<BackupGroup> = merged
+            .into_iter()
+            .map(|(key, (mut snapshots, dirs))| {
+                snapshots.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+                let name = names
+                    .get(key.as_str())
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| dirs.iter().find_map(|d| read_name_file(d)))
+                    .or_else(|| {
+                        // Snapshots taken before names were recorded are filed
+                        // under Minecraft's own folder id (`9Ysgap55yI8=`),
+                        // which is meaningless on screen. Read the name out of
+                        // the newest snapshot and cache it so this happens once.
+                        let found = snapshots
+                            .first()
+                            .and_then(|s| mcworld::name_in_archive(&s.path));
+                        if let (Some(name), Some(dir)) = (&found, dirs.first()) {
+                            let _ = fs::write(dir.join("name.txt"), name);
+                        }
+                        found
+                    })
+                    .unwrap_or_else(|| "Unknown world".to_owned());
+                BackupGroup { key, name, snapshots }
+            })
+            .collect();
+
         groups.sort_by(|a, b| {
-            let a_newest = a.snapshots.first().map(|s| s.stamp.clone()).unwrap_or_default();
-            let b_newest = b.snapshots.first().map(|s| s.stamp.clone()).unwrap_or_default();
-            b_newest.cmp(&a_newest)
+            let a_newest = a.snapshots.first().map(|s| s.stamp.as_str()).unwrap_or("");
+            let b_newest = b.snapshots.first().map(|s| s.stamp.as_str()).unwrap_or("");
+            b_newest.cmp(a_newest)
         });
         groups
     }
 
     /// Snapshot history for an entry, newest first.
     ///
-    /// Also picks up snapshots filed under the world's `minecraftWorlds` folder
-    /// id, so history taken before the world was protected is not orphaned.
+    /// Also picks up snapshots filed under every `minecraftWorlds` folder the
+    /// world has occupied, so history taken before it was saved — or under an
+    /// earlier folder id — is not orphaned.
     pub fn snapshots(&self, entry: &LibraryEntry) -> Vec<Snapshot> {
         let mut keys = vec![entry.id.clone()];
+        keys.extend(entry.past_folders.iter().cloned());
         if let Some(folder) = &entry.origin_folder {
             keys.push(folder.clone());
         }
+        keys.sort();
+        keys.dedup();
+
         let mut out = Vec::new();
         for key in keys {
             out.extend(self.snapshots_for_key(&key));
@@ -796,6 +858,90 @@ mod tests {
             stamps.iter().any(|s| s.ends_with("-deleted")),
             "deletion snapshots survive pruning: {stamps:?}"
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Snapshots made before names were recorded are filed under Minecraft's
+    /// folder id; showing that id on screen is meaningless to a player.
+    #[test]
+    fn legacy_backups_get_their_name_from_the_snapshot() {
+        let base = temp("legacybackup");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        // Mimic the old layout: keyed by folder id, with no name.txt.
+        let key = "9Ysgap55yI8=";
+        let dir = vault.backups_dir().join(key);
+        fs::create_dir_all(&dir).unwrap();
+        mcworld::pack(&live, &dir.join("20260810-090000.mcworld")).unwrap();
+
+        let groups = vault.all_backups(&[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].name, "Spike Test World",
+            "the folder id must never be shown as a world name"
+        );
+        // And it is cached, so the archive is only read once.
+        assert_eq!(
+            fs::read_to_string(dir.join("name.txt")).unwrap().trim(),
+            "Spike Test World"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Before and after a world was saved to the vault, its snapshots land
+    /// under different keys; the player should still see one history.
+    #[test]
+    fn snapshots_from_before_and_after_saving_become_one_group() {
+        let base = temp("mergebackups");
+        let live = base.join("minecraftWorlds").join("9Ysgap55yI8=");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        // A snapshot taken while the world was only in Minecraft.
+        let legacy = vault.backups_dir().join("9Ysgap55yI8=");
+        fs::create_dir_all(&legacy).unwrap();
+        mcworld::pack(&live, &legacy.join("20260810-090000.mcworld")).unwrap();
+
+        // Then it gets saved, which snapshots again under the vault id.
+        let entry = vault.protect(&live, "9Ysgap55yI8=", "20260810-100000").unwrap();
+
+        let groups = vault.all_backups(&vault.list().unwrap());
+        assert_eq!(groups.len(), 1, "one world should mean one group: {groups:#?}");
+        assert_eq!(groups[0].key, entry.id);
+        assert_eq!(groups[0].name, "Spike Test World");
+        assert_eq!(groups[0].snapshots.len(), 2, "both snapshots are listed");
+
+        // Archiving clears the live link; the history must survive it.
+        let archived = vault.archive(&live, "9Ysgap55yI8=", "20260810-110000").unwrap();
+        let after = vault.all_backups(&vault.list().unwrap());
+        assert_eq!(after.len(), 1, "archiving must not split the history: {after:#?}");
+        assert_eq!(vault.snapshots(&archived).len(), 3);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Two different worlds can share a name, so histories must never be
+    /// merged on name alone.
+    #[test]
+    fn same_named_worlds_keep_separate_histories() {
+        let base = temp("samename");
+        let vault = Vault::open(base.join("vault")).unwrap();
+        for (folder, stamp) in [("aaa=", "20260810-100000"), ("bbb=", "20260810-110000")] {
+            let live = base.join("minecraftWorlds").join(folder);
+            make_world(&live, "My World");
+            vault.protect(&live, folder, stamp).unwrap();
+        }
+
+        let groups = vault.all_backups(&vault.list().unwrap());
+        // Both carry the fixture's LevelName, so this is the name-collision
+        // case: identical names, but they must stay two separate histories.
+        assert_eq!(groups.len(), 2, "two distinct worlds, two histories");
+        assert_eq!(groups[0].name, groups[1].name, "the names really do collide");
+        assert_ne!(groups[0].key, groups[1].key);
 
         let _ = fs::remove_dir_all(&base);
     }

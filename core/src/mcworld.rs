@@ -77,6 +77,30 @@ pub fn unpack(mcworld: &Path, dest: &Path) -> Result<u64> {
     Ok(count)
 }
 
+/// Read a world's name out of a `.mcworld` without unpacking it.
+///
+/// `levelname.txt` first because it is a couple of bytes; `level.dat` is the
+/// fallback, since a world can be packed without the text file.
+pub fn name_in_archive(mcworld: &Path) -> Option<String> {
+    let file = File::open(mcworld).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+
+    if let Ok(mut entry) = zip.by_name("levelname.txt") {
+        let mut text = String::new();
+        if std::io::Read::read_to_string(&mut entry, &mut text).is_ok() {
+            let text = text.trim().to_owned();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    let mut entry = zip.by_name("level.dat").ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut bytes).ok()?;
+    crate::level_dat::parse(&bytes).ok()?.name.filter(|n| !n.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::scan;
 
+
 const REALMS_BASE: &str = "https://pocket.realms.minecraft.net";
 /// Sent when the installed game's version cannot be determined. Realms rejects
 /// clients it considers outdated, so this is a floor, not a preference.

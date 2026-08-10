@@ -64,6 +64,8 @@ enum Cmd {
         /// Live world folder, or the folder id shown by `scan`; omit for all
         world: Option<String>,
     },
+    /// List every backup, grouped by world
+    Backups,
     /// List snapshot history for a vault world
     Snapshots {
         /// Library id shown by `library`
@@ -139,6 +141,7 @@ fn main() -> Result<()> {
         Cmd::Move { dest } => cmd_move(vault_root, &dest),
         Cmd::Library => cmd_library(vault_root),
         Cmd::Protect { world } => cmd_protect(vault_root, world.as_deref()),
+        Cmd::Backups => cmd_backups(vault_root),
         Cmd::Snapshots { id } => cmd_snapshots(vault_root, &id),
         Cmd::Restore { snapshot } => cmd_restore(vault_root, &snapshot),
         Cmd::Delete { id } => cmd_delete(vault_root, &id),
@@ -482,6 +485,30 @@ fn cmd_protect(root: Option<PathBuf>, world: Option<&str>) -> Result<()> {
             n => format!("Protected {n} world(s)."),
         }
     );
+    Ok(())
+}
+
+fn cmd_backups(root: Option<PathBuf>) -> Result<()> {
+    let vault = open_vault(root)?;
+    let library = vault.list()?;
+    let groups = vault.all_backups(&library);
+    if groups.is_empty() {
+        println!("No backups yet.");
+        return Ok(());
+    }
+    let mut total = 0u64;
+    for g in &groups {
+        let size: u64 = g.snapshots.iter().map(|s| s.size_bytes).sum();
+        total += size;
+        println!(
+            "{:<34} {:>3} backup(s)  {:>9}   newest {}",
+            truncate(&g.name, 34),
+            g.snapshots.len(),
+            human_size(size),
+            g.snapshots.first().map(|s| s.stamp.as_str()).unwrap_or("-"),
+        );
+    }
+    println!("\n{} world(s) backed up, {}", groups.len(), human_size(total));
     Ok(())
 }
 
