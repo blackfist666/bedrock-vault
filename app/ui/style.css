@@ -17,6 +17,11 @@
   --red: #a63a34;
   --red-hi: #c14a42;
   --amber: #d8973c;
+  /* Realms purple. Anything that reaches out to a Realm wears it, so at a
+     glance it is obvious which buttons touch the Realm and which stay local. */
+  --purple: #7d3fb5;
+  --purple-hi: #9152cc;
+  --purple-edge: #4a2470;
 }
 
 * { box-sizing: border-box; }
@@ -67,7 +72,7 @@ header {
 .hero {
   background: var(--panel);
   border: 2px solid var(--edge);
-  border-left: 5px solid var(--green);
+  border-left: 5px solid var(--purple);
   padding: 16px 18px;
   display: flex;
   flex-direction: column;
@@ -90,7 +95,7 @@ header {
   gap: 7px;
 }
 
-.slot.live { border-color: var(--green); }
+.slot.live { border-color: var(--purple); }
 .slot.empty { border-style: dashed; border-color: #46474b; background: #202124; }
 .empty-name { color: var(--muted); font-weight: 500; }
 .slot-head { display: flex; align-items: center; gap: 8px; }
@@ -161,6 +166,10 @@ header {
   color: var(--text);
 }
 
+/* The Realms tab is the one place the app leaves this PC. */
+.tab[data-section="realms"].active { border-color: var(--purple); }
+.tab[data-section="realms"].active .tab-name { color: #d7b8f2; }
+
 .tab-icon { font-size: 18px; line-height: 1; filter: saturate(0.85); }
 .tab-text { display: flex; flex-direction: column; }
 .tab-name { font-weight: 600; }
@@ -207,6 +216,8 @@ header {
 .mc-btn.green:hover:not(:disabled) { background: var(--green-hi); }
 .mc-btn.red { background: var(--red); border-bottom-color: #6d241f; }
 .mc-btn.red:hover:not(:disabled) { background: var(--red-hi); }
+.mc-btn.purple { background: var(--purple); border-bottom-color: var(--purple-edge); }
+.mc-btn.purple:hover:not(:disabled) { background: var(--purple-hi); }
 .mc-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .mc-btn.small { padding: 7px 13px; font-size: 13px; }
 

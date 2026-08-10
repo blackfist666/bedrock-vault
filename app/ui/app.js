@@ -162,6 +162,7 @@ function vaultRows() {
     }
     if (state.realmTargets && state.realmTargets.length) {
       actions.push(button("Send to Realm", {
+        className: "purple",
         help: "Put this world onto one of your Realms, so everyone can play it.",
         onClick: () => chooseRealm(w),
       }));
@@ -245,7 +246,7 @@ function realmHero(realm) {
   const actions = el("div", "row-actions");
   if (realm.can_download) {
     actions.append(button("Copy world to vault", {
-      className: "green",
+      className: "purple",
       help: "Download this Realm's current world into your vault. Nothing on the Realm changes.",
       onClick: () => confirmRun(
         `Copy "${realm.name}" into your vault?`,
@@ -254,6 +255,7 @@ function realmHero(realm) {
         { realmId: realm.id, slot: realm.active_slot, name: realm.name }),
     }));
     actions.append(button("Put a vault world here", {
+      className: "purple",
       help: "Replace this Realm's world with one from your vault.",
       onClick: () => chooseVaultWorld(realm),
     }));
@@ -288,7 +290,7 @@ function realmHero(realm) {
       if (realm.can_download) {
         const emptyActions = el("div", "row-actions");
         emptyActions.append(button("Put a world here", {
-          className: "green",
+          className: "purple",
           help: "Send a world from your vault to this slot.",
           onClick: () => chooseVaultWorld(realm, slot.slot_id),
         }));
@@ -331,7 +333,7 @@ function realmHero(realm) {
       const slotActions = el("div", "row-actions");
       if (!slot.active) {
         slotActions.append(button("Play this one", {
-          className: "green",
+          className: "purple",
           help: "Make this the world the Realm runs.",
           onClick: () => confirmRun(
             `Switch the Realm to "${slot.name}"?`,
@@ -340,10 +342,12 @@ function realmHero(realm) {
         }));
       }
       slotActions.append(button("Replace", {
+        className: "purple",
         help: "Put a different world from your vault on this slot.",
         onClick: () => chooseVaultWorld(realm, slot.slot_id),
       }));
       slotActions.append(button("Rename", {
+        className: "purple",
         help: "Change the world's name as shown in Minecraft.",
         onClick: () => askText(
           `Rename the world on slot ${slot.slot_id}`,
@@ -396,6 +400,7 @@ function realmSummaryRow(realm) {
   const actions = [];
   if (realm.can_download) {
     actions.push(button("Copy to vault", {
+      className: "purple",
       help: "Download this Realm's world into your vault.",
       onClick: () => confirmRun(
         `Copy "${realm.name}" into your vault?`,
@@ -437,7 +442,7 @@ function realmRows() {
     panel.append(el("div", "big-code", state.login.user_code));
     const actions = el("div", "signin-actions");
     actions.append(button("Open the sign-in page", {
-      className: "green",
+      className: "purple",
       onClick: () => invoke("open_url", { url: state.login.verification_uri }).catch(() => {}),
     }));
     actions.append(button("Cancel", { onClick: cancelLogin }));
@@ -454,7 +459,7 @@ function realmRows() {
     panel.append(el("p", null,
       "Use the same Microsoft account you use for Minecraft. You will get a short code to type on Microsoft's website — Bedrock Vault never sees your password."));
     const actions = el("div", "signin-actions");
-    actions.append(button("Sign in with Microsoft", { className: "green", onClick: beginLogin }));
+    actions.append(button("Sign in with Microsoft", { className: "purple", onClick: beginLogin }));
     panel.append(actions);
     return [panel];
   }
@@ -875,7 +880,7 @@ function chooseRealm(world) {
   const list = el("div", "realm-choices");
   for (const realm of targets) {
     list.append(button(realm.name, {
-      className: "green",
+      className: "purple",
       onClick: () => {
         close();
         run("realm_upload", { realmId: realm.id, slot: realm.active_slot, id: world.id });
