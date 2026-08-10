@@ -5,10 +5,15 @@
 
 use std::process::Command;
 
-/// Executable names used by the Bedrock client across install types.
-pub const MINECRAFT_PROCESSES: &[&str] = &["Minecraft.Windows.exe", "Minecraft.exe"];
+/// Any running process whose image name contains this is treated as the game.
+///
+/// Matching on a substring rather than an exact list is deliberate: Bedrock
+/// ships under several names across install types (`Minecraft.Windows.exe` for
+/// the Store/UWP build, `Minecraft.exe` for the Xbox launcher build) and a name
+/// this guard has not heard of must fail *safe*, not silently allow a copy.
+const GAME_MARKER: &str = "minecraft";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GameStatus {
     /// Process names currently running (empty = safe to operate).
     pub running: Vec<String>,
@@ -21,39 +26,42 @@ impl GameStatus {
 }
 
 /// Ask Windows which Minecraft processes are running.
-///
-/// A failure to query is reported as "not running" rather than an error: the
-/// caller still verifies its work, and a broken tasklist should not make the
-/// whole app unusable. Callers that need certainty check [`GameStatus`].
 pub fn game_status() -> GameStatus {
-    let mut running = Vec::new();
-    for name in MINECRAFT_PROCESSES {
-        if process_exists(name) {
-            running.push((*name).to_owned());
-        }
-    }
+    let mut running: Vec<String> = running_processes()
+        .into_iter()
+        .filter(|name| name.to_lowercase().contains(GAME_MARKER))
+        .collect();
+    running.sort();
+    running.dedup();
     GameStatus { running }
 }
 
+/// Every running process image name, or an empty list if the query fails.
+///
+/// One `tasklist` call rather than one per candidate name: it is ~100ms, and
+/// this runs on a UI poll.
 #[cfg(windows)]
-fn process_exists(exe: &str) -> bool {
-    // tasklist prints a "no tasks" banner (not an error) when nothing matches.
-    let Ok(out) = Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH", "/FO", "CSV"])
-        .output()
-    else {
-        return false;
+fn running_processes() -> Vec<String> {
+    let Ok(out) = Command::new("tasklist").args(["/NH", "/FO", "CSV"]).output() else {
+        return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout).contains(exe)
+    // Rows look like: "name.exe","1234","Console","1","12,345 K"
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"'))
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[cfg(not(windows))]
-fn process_exists(_exe: &str) -> bool {
+fn running_processes() -> Vec<String> {
     let _ = Command::new("true");
-    false
+    Vec::new()
 }
 
-/// Error returned by vault operations refused because the game is open.
+/// Refuse an operation while the game is open.
 pub fn ensure_closed() -> anyhow::Result<()> {
     let status = game_status();
     if status.is_running() {
@@ -63,4 +71,41 @@ pub fn ensure_closed() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard is only as good as its ability to see processes at all, and it
+    /// fails *open* (reports "not running") when the query breaks — so prove
+    /// the query works by finding the test binary itself.
+    #[test]
+    #[cfg(windows)]
+    fn process_listing_finds_this_process() {
+        let me = std::env::current_exe().unwrap();
+        let my_name = me.file_name().unwrap().to_string_lossy().to_lowercase();
+        let processes = running_processes();
+        assert!(
+            !processes.is_empty(),
+            "tasklist returned nothing — the process guard cannot work"
+        );
+        assert!(
+            processes.iter().any(|p| p.to_lowercase() == my_name),
+            "expected to find '{my_name}' among {} running processes",
+            processes.len()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn matching_is_case_insensitive_and_substring_based() {
+        for name in ["Minecraft.Windows.exe", "Minecraft.exe", "minecraft.exe"] {
+            assert!(
+                name.to_lowercase().contains(GAME_MARKER),
+                "'{name}' must be recognised as the game"
+            );
+        }
+        assert!(!"bedrock-vault.exe".to_lowercase().contains(GAME_MARKER));
+    }
 }

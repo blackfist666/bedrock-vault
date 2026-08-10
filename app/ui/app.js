@@ -339,4 +339,34 @@ listen("progress", (event) => {
   showProgress(current ? `Saving "${current}"…` : "Finishing…", done, total);
 });
 
+/// Watch for Minecraft opening or closing.
+///
+/// Without this the guard is only checked when the window opens, so starting
+/// the game afterwards leaves every button live — exactly the case the guard
+/// exists to prevent. Only the cheap process check runs on the timer; the full
+/// listing is reloaded once, when the game closes and worlds may have changed.
+async function watchGame() {
+  if (state.busy || !state.data) return;
+  try {
+    const running = await invoke("game_status");
+    const was = state.data.game_running.length > 0;
+    const now = running.length > 0;
+    if (was === now) return;
+    state.data.game_running = running;
+    if (now) {
+      banner("Minecraft is open. Close the game before moving worlds around, so nothing gets damaged.", "");
+      document.getElementById("status").textContent = "Minecraft is open — close it to move worlds";
+      document.getElementById("status").className = "status warn";
+      render();
+    } else {
+      await load();
+    }
+  } catch (e) {
+    // A failed poll must not break the window; the next tick tries again.
+    console.error("game poll failed", e);
+  }
+}
+
+setInterval(watchGame, 3000);
+
 load().catch((e) => banner(String(e), "error"));

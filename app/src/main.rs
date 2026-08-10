@@ -158,6 +158,16 @@ async fn overview() -> Result<OverviewDto, String> {
     blocking(build_overview).await
 }
 
+/// Cheap poll of just the process guard.
+///
+/// The UI checks this on a timer so the "Minecraft is open" warning appears
+/// when the game is started *after* the window was opened — the full overview
+/// walks the worlds and is far too heavy to run every few seconds.
+#[tauri::command]
+async fn game_status() -> Result<Vec<String>, String> {
+    blocking(|| Ok(guard::game_status().running)).await
+}
+
 fn build_overview() -> Result<OverviewDto, String> {
     let index = pack_index();
     let vault = open_vault()?;
@@ -463,8 +473,8 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            overview, save_to_vault, save_all, put_away, play, back_up, delete, restore, import,
-            export, open_folder
+            overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
+            restore, import, export, open_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");
