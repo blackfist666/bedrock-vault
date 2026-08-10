@@ -326,6 +326,10 @@ function realmHero(realm) {
         slot.rules.map(([k, v]) => `${k}: ${v}`).join(" · ")));
     }
     if (slot.seed) s.append(el("div", "slot-rules", `Seed ${slot.seed}`));
+    if (!slot.can_backup) {
+      s.append(el("div", "slot-warn",
+        "Minecraft has no saved copy of this world yet, so it cannot be copied to your vault."));
+    }
 
     if (realm.can_download) {
       const slotActions = el("div", "row-actions");
@@ -351,6 +355,16 @@ function realmHero(realm) {
           slot.name === "Unnamed world" ? "" : slot.name,
           (name) => run("realm_rename_slot", { realmId: realm.id, slot: slot.slot_id, name })),
       }));
+      if (slot.can_backup) {
+        slotActions.append(button("Copy to vault", {
+          help: "Download this slot's world into your vault. Nothing on the Realm changes.",
+          onClick: () => confirmRun(
+            `Copy "${slot.name}" into your vault?`,
+            "The world is downloaded and added to your vault. Nothing on the Realm is changed.",
+            "Yes, copy it", "realm_download",
+            { realmId: realm.id, slot: slot.slot_id, name: slot.name }),
+        }));
+      }
       if (slot.packs.length) {
         slotActions.append(button("Turn off add-ons", {
           className: "red",
@@ -814,10 +828,19 @@ function chooseVaultWorld(realm, slotId) {
   const modal = document.getElementById("modal");
   document.getElementById("modal-title").textContent =
     `Put which world on slot ${slot}?`;
-  document.getElementById("modal-body").textContent = target?.empty
-    ? "This slot is empty, so nothing will be replaced. The Realm closes while the world is sent and reopens afterwards."
-    : "The world already on this slot is downloaded into your vault first, so nothing is lost. " +
+  let explanation;
+  if (target?.empty) {
+    explanation = "This slot is empty, so nothing will be replaced. " +
+      "The Realm closes while the world is sent and reopens afterwards.";
+  } else if (target && !target.can_backup) {
+    explanation = `Careful: Minecraft has no saved copy of "${target.name}" yet, so it cannot be kept — ` +
+      "replacing it will lose it. Minecraft only keeps a copy once it has made its own backup, " +
+      "which usually means playing the world for a while first.";
+  } else {
+    explanation = "The world already on this slot is downloaded into your vault first, so nothing is lost. " +
       "The Realm closes while the swap happens and reopens afterwards.";
+  }
+  document.getElementById("modal-body").textContent = explanation;
   const ok = document.getElementById("modal-ok");
   const cancel = document.getElementById("modal-cancel");
   ok.style.display = "none";
