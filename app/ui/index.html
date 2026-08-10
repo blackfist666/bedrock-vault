@@ -7,9 +7,28 @@
   </head>
   <body>
     <header>
-      <h1>Bedrock Vault</h1>
+      <div class="brand">BEDROCK VAULT</div>
       <div id="status" class="status"></div>
     </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-section="live">
+        <span class="tab-icon">🎮</span>
+        <span class="tab-text"><span class="tab-name">In Minecraft</span><span class="tab-sub" id="count-live"></span></span>
+      </button>
+      <button class="tab" data-section="vault">
+        <span class="tab-icon">🧰</span>
+        <span class="tab-text"><span class="tab-name">Vault</span><span class="tab-sub" id="count-vault"></span></span>
+      </button>
+      <button class="tab" data-section="backups">
+        <span class="tab-icon">🕘</span>
+        <span class="tab-text"><span class="tab-name">Backups</span><span class="tab-sub" id="count-backups"></span></span>
+      </button>
+      <button class="tab" data-section="realms">
+        <span class="tab-icon">🌐</span>
+        <span class="tab-text"><span class="tab-name">Realms</span><span class="tab-sub" id="count-realms"></span></span>
+      </button>
+    </nav>
 
     <div id="banner" class="banner hidden"></div>
 
@@ -18,38 +37,21 @@
       <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
     </div>
 
-    <nav class="steps">
-      <button class="step active" data-section="live">
-        <span class="step-name">In Minecraft</span>
-        <span class="step-sub" id="count-live"></span>
-      </button>
-      <span class="arrow">→</span>
-      <button class="step" data-section="vault">
-        <span class="step-name">Vault</span>
-        <span class="step-sub" id="count-vault"></span>
-      </button>
-      <span class="arrow">→</span>
-      <button class="step" data-section="backups">
-        <span class="step-name">Backups</span>
-        <span class="step-sub" id="count-backups"></span>
-      </button>
-    </nav>
-
     <section class="bar">
       <p id="explain" class="explain"></p>
       <div class="bar-actions">
-        <input id="search" type="search" placeholder="Find a world…" />
-        <button id="main-action" class="big"></button>
+        <input id="search" type="search" placeholder="Find a world" />
+        <button id="main-action" class="mc-btn green"></button>
       </div>
     </section>
 
-    <main id="grid" class="grid"></main>
+    <main id="grid" class="list"></main>
 
     <footer>
       <div id="footer"></div>
       <div class="footer-row">
         <span id="vault-path"></span>
-        <button id="change-location" class="link">Change folder…</button>
+        <button id="change-location" class="link">Change folder</button>
         <button id="open-vault" class="link">Open in Explorer</button>
       </div>
     </footer>
@@ -59,8 +61,8 @@
         <h3 id="modal-title"></h3>
         <p id="modal-body"></p>
         <div class="modal-actions">
-          <button id="modal-cancel" class="ghost">No, go back</button>
-          <button id="modal-ok" class="big"></button>
+          <button id="modal-cancel" class="mc-btn">No, go back</button>
+          <button id="modal-ok" class="mc-btn green"></button>
         </div>
       </div>
     </div>

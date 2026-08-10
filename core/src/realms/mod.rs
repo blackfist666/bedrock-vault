@@ -95,6 +95,41 @@ fn version_key(v: &str) -> Vec<i64> {
     v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
+/// The signed-in session, refreshing the token when it has aged out.
+///
+/// A token saved before the XUID was captured counts as stale too: without it,
+/// an owned Realm cannot be told from a joined one.
+pub fn session(force_refresh: bool) -> Result<auth::XstsToken> {
+    let mut saved = cache::load();
+    let microsoft = saved
+        .microsoft
+        .clone()
+        .context("not signed in")?;
+
+    if let Some(token) = &saved.realms {
+        if !force_refresh && !token.is_expired() && token.xuid.is_some() {
+            return Ok(token.clone());
+        }
+    }
+
+    let refreshed = auth::refresh(&microsoft.refresh_token)?;
+    let token = auth::realms_session(&refreshed.access_token)?;
+    saved.microsoft = Some(refreshed);
+    saved.realms = Some(token.clone());
+    cache::save(&saved)?;
+    Ok(token)
+}
+
+/// Finish a device-code sign-in and save the session.
+pub fn complete_login(tokens: auth::MicrosoftTokens) -> Result<auth::XstsToken> {
+    let token = auth::realms_session(&tokens.access_token)?;
+    cache::save(&cache::Session {
+        microsoft: Some(tokens),
+        realms: Some(token.clone()),
+    })?;
+    Ok(token)
+}
+
 /// The service's raw `/worlds` response, for inspecting an API that can change.
 pub fn list_raw(session: &auth::XstsToken) -> Result<serde_json::Value> {
     request(session, "GET", "/worlds")

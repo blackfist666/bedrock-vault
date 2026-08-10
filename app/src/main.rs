@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bedrock_vault_core::{
-    config, guard, packs, scan,
+    config, guard, packs, realms, scan,
     vault::{self, Protection, Vault},
 };
 use chrono::Local;
@@ -54,6 +54,7 @@ struct LiveWorldDto {
     saved_label: String,
     packs: Vec<String>,
     missing_packs: usize,
+    icon: Option<String>,
     error: Option<String>,
 }
 
@@ -70,6 +71,7 @@ struct VaultWorldDto {
     packs: Vec<String>,
     missing_packs: usize,
     backup_count: usize,
+    icon: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -139,6 +141,26 @@ fn world_packs(world_dir: &std::path::Path, index: &HashMap<String, String>) -> 
     names.sort();
     names.dedup();
     (names, missing)
+}
+
+/// A world's `world_icon.jpeg` as a data URI, for the thumbnail in the list.
+///
+/// Inlined rather than served from disk because the webview's content policy
+/// blocks arbitrary local files. Oversized icons are skipped rather than
+/// bloating every refresh.
+fn world_icon(world_dir: &std::path::Path) -> Option<String> {
+    use base64::Engine;
+
+    const MAX_ICON_BYTES: u64 = 512 * 1024;
+    let path = world_dir.join("world_icon.jpeg");
+    if std::fs::metadata(&path).ok()?.len() > MAX_ICON_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 /// `20260810-102406` -> `10 Aug 2026, 10:24`; deletion snapshots say so.
@@ -212,6 +234,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 },
                 packs: names,
                 missing_packs: missing,
+                icon: world_icon(&dir),
                 error,
             });
         }
@@ -235,6 +258,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 packs: names,
                 missing_packs: missing,
                 backup_count: vault.snapshots(e).len(),
+                icon: world_icon(&e.world_dir),
             }
         })
         .collect();
@@ -453,6 +477,158 @@ async fn export(id: String) -> Result<String, String> {
     .await
 }
 
+#[derive(Serialize)]
+struct RealmDto {
+    id: i64,
+    name: String,
+    state: String,
+    subscription: String,
+    expired: bool,
+    active_slot: Option<i64>,
+    max_players: Option<i64>,
+    /// "yours", "joined", or "?" when it cannot be determined.
+    role: &'static str,
+}
+
+#[derive(Serialize)]
+struct RealmsDto {
+    signed_in: bool,
+    gamertag: Option<String>,
+    realms: Vec<RealmDto>,
+    /// Present when the account is signed in but the listing failed.
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LoginDto {
+    user_code: String,
+    verification_uri: String,
+    interval_secs: u64,
+}
+
+/// A device-code sign-in waiting for the user to finish at microsoft.com/link.
+#[derive(Default)]
+struct PendingLogin(std::sync::Mutex<Option<realms::auth::DeviceLogin>>);
+
+#[tauri::command]
+async fn realms_overview() -> Result<RealmsDto, String> {
+    blocking(|| {
+        if !realms::cache::is_signed_in() {
+            return Ok(RealmsDto {
+                signed_in: false,
+                gamertag: None,
+                realms: Vec::new(),
+                error: None,
+            });
+        }
+        let session = match realms::session(false) {
+            Ok(s) => s,
+            // Signed in but the token could not be renewed: report it rather
+            // than silently showing an empty list.
+            Err(e) => {
+                return Ok(RealmsDto {
+                    signed_in: true,
+                    gamertag: None,
+                    realms: Vec::new(),
+                    error: Some(format!("{e:#}")),
+                })
+            }
+        };
+        let gamertag = session.gamertag.clone();
+        match realms::list(&session) {
+            Ok(list) => Ok(RealmsDto {
+                signed_in: true,
+                gamertag,
+                realms: list
+                    .into_iter()
+                    .map(|r| RealmDto {
+                        subscription: r.subscription(),
+                        role: r.role(),
+                        id: r.id,
+                        name: r.name,
+                        state: r.state,
+                        expired: r.expired,
+                        active_slot: r.active_slot,
+                        max_players: r.max_players,
+                    })
+                    .collect(),
+                error: None,
+            }),
+            Err(e) => Ok(RealmsDto {
+                signed_in: true,
+                gamertag,
+                realms: Vec::new(),
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn realms_begin_login(pending: tauri::State<'_, PendingLogin>) -> Result<LoginDto, String> {
+    let login = blocking(|| realms::auth::start_device_login().map_err(|e| format!("{e:#}"))).await?;
+    let dto = LoginDto {
+        user_code: login.user_code.clone(),
+        verification_uri: login.verification_uri.clone(),
+        interval_secs: login.interval_secs,
+    };
+    *pending.0.lock().map_err(|_| "sign-in state was poisoned")? = Some(login);
+    Ok(dto)
+}
+
+/// One poll of a sign-in in progress. `None` means the user has not finished.
+#[tauri::command]
+async fn realms_poll_login(
+    pending: tauri::State<'_, PendingLogin>,
+) -> Result<Option<String>, String> {
+    let device_code = {
+        let guard = pending.0.lock().map_err(|_| "sign-in state was poisoned")?;
+        guard.as_ref().map(|l| l.device_code.clone())
+    };
+    let device_code = device_code.ok_or("no sign-in is in progress")?;
+
+    let tokens = blocking(move || {
+        realms::auth::poll_device_login(&device_code).map_err(|e| format!("{e:#}"))
+    })
+    .await?;
+
+    let Some(tokens) = tokens else { return Ok(None) };
+    let session =
+        blocking(move || realms::complete_login(tokens).map_err(|e| format!("{e:#}"))).await?;
+    *pending.0.lock().map_err(|_| "sign-in state was poisoned")? = None;
+    Ok(Some(session.gamertag.unwrap_or_else(|| "your account".into())))
+}
+
+#[tauri::command]
+async fn realms_cancel_login(pending: tauri::State<'_, PendingLogin>) -> Result<(), String> {
+    *pending.0.lock().map_err(|_| "sign-in state was poisoned")? = None;
+    Ok(())
+}
+
+#[tauri::command]
+async fn realms_sign_out() -> Result<String, String> {
+    blocking(|| {
+        realms::cache::clear().map_err(|e| format!("{e:#}"))?;
+        Ok("Signed out".to_owned())
+    })
+    .await
+}
+
+/// Open a link in the default browser.
+#[tauri::command]
+async fn open_url(url: String) -> Result<String, String> {
+    // Only ever our own sign-in page; never a value from the page itself.
+    if url != "https://www.microsoft.com/link" && !url.starts_with("https://login.live.com/") {
+        return Err("refused to open that address".into());
+    }
+    std::process::Command::new("explorer")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| format!("could not open the browser: {e}"))?;
+    Ok(String::new())
+}
+
 /// Move the vault to a new folder, or adopt a vault that is already there.
 ///
 /// An empty destination gets the current vault moved into it; a folder that
@@ -516,9 +692,11 @@ async fn open_folder(which: String) -> Result<String, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(PendingLogin::default())
         .invoke_handler(tauri::generate_handler![
             overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
-            restore, import, export, open_folder, set_vault_location
+            restore, import, export, open_folder, set_vault_location, realms_overview,
+            realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out, open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");
