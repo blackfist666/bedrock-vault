@@ -182,17 +182,43 @@ fn template_pictures() -> HashMap<String, String> {
     out
 }
 
-/// The picture to show for a world: its own, or the template's it was built
-/// from. Never anything invented — a world with neither shows none.
-fn world_picture(world_dir: &std::path::Path, templates: &HashMap<String, String>) -> Option<String> {
-    if let Some(icon) = world_icon(world_dir) {
-        return Some(icon);
-    }
+/// The artwork of the marketplace template a world was built from.
+///
+/// A shop banner, not a picture of anyone's world — so it is only ever a
+/// last resort, never a replacement for a real one.
+fn template_art(world_dir: &std::path::Path, templates: &HashMap<String, String>) -> Option<String> {
     let (resource, behavior) = packs::world_pack_refs(world_dir);
     resource
         .into_iter()
         .chain(behavior)
         .find_map(|r| templates.get(&r.uuid.replace('-', "").to_lowercase()).cloned())
+}
+
+/// The picture to show for a world, given every copy of it held on this PC.
+///
+/// A real `world_icon.jpeg` always wins, from *whichever* copy has one: the
+/// game writes that picture only for a world played here, so the vault copy of
+/// a world that was played in the game has none while the copy in the game
+/// does. Only when no copy has been played does the template's shop artwork
+/// stand in, and a world with neither shows nothing at all.
+fn world_picture(copies: &[PathBuf], templates: &HashMap<String, String>) -> Option<String> {
+    copies
+        .iter()
+        .find_map(|dir| world_icon(dir))
+        .or_else(|| copies.iter().find_map(|dir| template_art(dir, templates)))
+}
+
+/// Every copy of the world in this folder, that one first.
+fn copies_of(world_dir: &std::path::Path, by_seed: &HashMap<String, Vec<PathBuf>>) -> Vec<PathBuf> {
+    let mut out = vec![world_dir.to_path_buf()];
+    let seed = std::fs::read(world_dir.join("level.dat"))
+        .ok()
+        .and_then(|d| bedrock_vault_core::level_dat::parse(&d).ok())
+        .and_then(|m| m.seed);
+    if let Some(others) = seed.and_then(|s| by_seed.get(&s.to_string())) {
+        out.extend(others.iter().filter(|d| *d != world_dir).cloned());
+    }
+    out
 }
 
 /// A world's `world_icon.jpeg` as a data URI, for the thumbnail in the list.
@@ -245,6 +271,7 @@ async fn game_status() -> Result<Vec<String>, String> {
 fn build_overview() -> Result<OverviewDto, String> {
     let index = pack_index();
     let templates = template_pictures();
+    let by_seed = worlds_by_seed();
     let vault = open_vault()?;
     let library = vault.list().map_err(|e| format!("{e:#}"))?;
 
@@ -287,7 +314,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 },
                 packs: names,
                 missing_packs: missing,
-                icon: world_picture(&dir, &templates),
+                icon: world_picture(&copies_of(&dir, &by_seed), &templates),
                 error,
             });
         }
@@ -311,7 +338,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 packs: names,
                 missing_packs: missing,
                 backup_count: vault.snapshots(e).len(),
-                icon: world_picture(&e.world_dir, &templates),
+                icon: world_picture(&copies_of(&e.world_dir, &by_seed), &templates),
                 source: e.source.clone(),
             }
         })
@@ -876,9 +903,7 @@ fn slot_picture(
     by_seed: &HashMap<String, Vec<PathBuf>>,
     templates: &HashMap<String, String>,
 ) -> Option<String> {
-    if let Some(icon) =
-        local_copies(slot, by_seed).iter().find_map(|dir| world_picture(dir, templates))
-    {
+    if let Some(icon) = world_picture(local_copies(slot, by_seed), templates) {
         return Some(icon);
     }
     let url = slot.template_image.as_deref()?;
