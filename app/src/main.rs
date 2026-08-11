@@ -487,6 +487,19 @@ async fn import(path: String) -> Result<String, String> {
             vault.import_mcworld(&source, &stamp())
         }
         .map_err(|e| format!("{e:#}"))?;
+
+        // A file carries no provenance, so the only safe claim is identical
+        // content. Checked after unpacking — comparing a folder is the same
+        // work either way — and the new entry is dropped if the vault already
+        // holds that exact world.
+        let already = vault.find_same_content(&entry.world_dir, &entry.id).unwrap_or(None);
+        if let Some(held) = already {
+            vault.forget(&entry.id).map_err(|e| format!("{e:#}"))?;
+            return Ok(format!(
+                "\"{}\" is already in your vault, so nothing was added",
+                held.name
+            ));
+        }
         Ok(format!("Added \"{}\" to the vault", entry.name))
     })
     .await
@@ -1075,14 +1088,39 @@ async fn realm_download(
             _ => false,
         };
 
-        let entry = vault
-            .import_mcworld(&temp, &stamp())
-            .map_err(|e| format!("{e:#}"))?;
+        // A world copied down from this slot before belongs to the entry it
+        // made then, so a second copy updates that world instead of leaving two
+        // of it in the vault.
+        let existing = vault.find_by_realm_slot(realm_id, slot).unwrap_or(None);
+        let (entry, unchanged) = match existing {
+            Some(held) => {
+                match vault
+                    .resync_mcworld(&held.id, &temp, &stamp())
+                    .map_err(|e| format!("{e:#}"))?
+                {
+                    vault::Resync::Unchanged(entry) => (entry, true),
+                    vault::Resync::Replaced(entry) => (entry, false),
+                }
+            }
+            None => (
+                vault.import_mcworld(&temp, &stamp()).map_err(|e| format!("{e:#}"))?,
+                false,
+            ),
+        };
         std::fs::remove_file(&temp).ok();
         vault
             .set_source(&entry.id, vault::SOURCE_REALM)
             .map_err(|e| format!("{e:#}"))?;
+        vault
+            .set_realm_slot(&entry.id, realm_id, slot)
+            .map_err(|e| format!("{e:#}"))?;
 
+        if unchanged {
+            return Ok(format!(
+                "\"{}\" is already in your vault and has not changed since you copied it",
+                entry.name
+            ));
+        }
         if wrong_world {
             let on_the_slot = expected
                 .and_then(|(name, _)| name)
@@ -1222,9 +1260,14 @@ async fn realm_upload(
         )
         .map_err(|e| format!("{e:#}"))?;
 
-        // The vault copy is on a Realm now, which is where it was last.
+        // The vault copy is on a Realm now, which is where it was last — and it
+        // is what that slot holds, so copying the slot back down later lands on
+        // this world rather than making another.
         vault
             .set_source(&entry.id, vault::SOURCE_REALM)
+            .map_err(|e| format!("{e:#}"))?;
+        vault
+            .set_realm_slot(&entry.id, realm_id, slot)
             .map_err(|e| format!("{e:#}"))?;
 
         Ok(match saved {
