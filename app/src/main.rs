@@ -72,6 +72,10 @@ struct VaultWorldDto {
     missing_packs: usize,
     backup_count: usize,
     icon: Option<String>,
+    /// Where this world last came from or last went — "minecraft", "realm",
+    /// "file", "backup", or absent for one untouched since the vault started
+    /// recording it.
+    source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +271,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 missing_packs: missing,
                 backup_count: vault.snapshots(e).len(),
                 icon: world_icon(&e.world_dir),
+                source: e.source.clone(),
             }
         })
         .collect();
@@ -1034,6 +1039,9 @@ async fn realm_download(
             .import_mcworld(&temp, &stamp())
             .map_err(|e| format!("{e:#}"))?;
         std::fs::remove_file(&temp).ok();
+        vault
+            .set_source(&entry.id, vault::SOURCE_REALM)
+            .map_err(|e| format!("{e:#}"))?;
 
         if wrong_world {
             let on_the_slot = expected
@@ -1173,6 +1181,11 @@ async fn realm_upload(
             |_, _| {},
         )
         .map_err(|e| format!("{e:#}"))?;
+
+        // The vault copy is on a Realm now, which is where it was last.
+        vault
+            .set_source(&entry.id, vault::SOURCE_REALM)
+            .map_err(|e| format!("{e:#}"))?;
 
         Ok(match saved {
             Some(saved) => format!(

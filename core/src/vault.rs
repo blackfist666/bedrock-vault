@@ -80,6 +80,15 @@ fn default_retention() -> usize {
     5
 }
 
+/// Where a world last came from, or last went: the values [`Meta::source`]
+/// takes, and the whole set the screen knows how to label.
+pub const SOURCE_MINECRAFT: &str = "minecraft";
+pub const SOURCE_REALM: &str = "realm";
+pub const SOURCE_FILE: &str = "file";
+pub const SOURCE_BACKUP: &str = "backup";
+pub const SOURCES: [&str; 4] =
+    [SOURCE_MINECRAFT, SOURCE_REALM, SOURCE_FILE, SOURCE_BACKUP];
+
 /// Provenance and sync state, stored beside each library world.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Meta {
@@ -88,6 +97,15 @@ struct Meta {
     /// Where the world came from: 'local' | 'imported' | 'restored'.
     #[serde(default)]
     origin: String,
+    /// Where this copy last came from or last went — see [`Vault::set_source`].
+    ///
+    /// Not the same question as `origin`, which records how the world first
+    /// entered the vault and never changes. Absent on entries written before
+    /// it existed: unknown, rather than guessed. Kept as a plain string so an
+    /// unrecognised value can never fail the whole file's parse and take the
+    /// rest of an entry's metadata down with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     /// `LastPlayed` of the source when the copy was taken; drives staleness.
     source_last_played: Option<i64>,
     /// When the vault copy was last written.
@@ -122,6 +140,9 @@ pub struct LibraryEntry {
     pub game_mode: &'static str,
     pub origin_folder: Option<String>,
     pub origin: String,
+    /// Where this copy last came from or last went: one of [`SOURCES`], or
+    /// `None` for a world last touched before the vault recorded it.
+    pub source: Option<String>,
     pub synced_at: Option<i64>,
     /// `LastPlayed` of the source when this copy was taken.
     pub source_last_played: Option<i64>,
@@ -262,6 +283,7 @@ impl Vault {
                 game_mode: level.as_ref().map(|m| m.game_mode_label()).unwrap_or("-"),
                 origin_folder: meta.origin_folder,
                 origin: meta.origin,
+                source: meta.source,
                 synced_at: meta.synced_at,
                 source_last_played: meta.source_last_played,
                 past_folders: meta.past_folders,
@@ -346,6 +368,9 @@ impl Vault {
         if meta.origin.is_empty() {
             meta.origin = "local".into();
         }
+        // Wherever this world came from before, it has just come out of the
+        // game — so that is where it was last.
+        meta.source = Some(SOURCE_MINECRAFT.to_owned());
         meta.source_last_played = live_last_played;
         meta.synced_at = Some(now());
         meta.size_bytes = Some(bytes);
@@ -388,6 +413,8 @@ impl Vault {
         }
         meta.origin_folder = Some(folder_id);
         meta.source_last_played = entry.last_played;
+        // It is in the game now, wherever it came from before.
+        meta.source = Some(SOURCE_MINECRAFT.to_owned());
         self.write_meta(id, &meta)?;
         Ok(dest)
     }
@@ -433,6 +460,13 @@ impl Vault {
         let entry = self.entry(id)?;
         let meta = Meta {
             origin_folder: None,
+            source: Some(
+                match origin {
+                    "restored" => SOURCE_BACKUP,
+                    _ => SOURCE_FILE,
+                }
+                .to_owned(),
+            ),
             origin: origin.to_owned(),
             source_last_played: entry.last_played,
             synced_at: Some(now()),
@@ -441,6 +475,17 @@ impl Vault {
         };
         self.write_meta(id, &meta)?;
         self.entry(id)
+    }
+
+    /// Record where a world last came from, or last went.
+    ///
+    /// Everything a world can arrive from is already known to the vault except
+    /// a Realm, which the caller holding the session has to say — and it is
+    /// also the one place a world *goes* to, so sending one up sets it too.
+    pub fn set_source(&self, id: &str, source: &str) -> Result<()> {
+        let mut meta = self.read_meta(id);
+        meta.source = Some(source.to_owned());
+        self.write_meta(id, &meta)
     }
 
     /// Remove a world from the library, leaving a final snapshot behind.
@@ -875,6 +920,46 @@ mod tests {
         assert_eq!(restored.name, "Spike Test World");
         assert_eq!(restored.origin, "restored");
         assert_eq!(vault.list().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The tag follows the world about: it says where it last was, not how it
+    /// first arrived, so re-saving from the game overwrites "realm".
+    #[test]
+    fn source_follows_where_the_world_last_was() {
+        let base = temp("source");
+        let live = base.join("minecraftWorlds").join("abc=");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let entry = vault.protect(&live, "abc=", "20260811-100000").unwrap();
+        assert_eq!(entry.source.as_deref(), Some(SOURCE_MINECRAFT));
+
+        // A Realm download is an import as far as the vault is concerned, so
+        // the caller with the session has to say where it really came from.
+        vault.set_source(&entry.id, SOURCE_REALM).unwrap();
+        assert_eq!(vault.entry(&entry.id).unwrap().source.as_deref(), Some(SOURCE_REALM));
+
+        // Saved out of the game again: it was last in Minecraft.
+        let resaved = vault.protect(&live, "abc=", "20260811-110000").unwrap();
+        assert_eq!(resaved.id, entry.id, "the same world, not a second entry");
+        assert_eq!(resaved.source.as_deref(), Some(SOURCE_MINECRAFT));
+
+        let mcworld = base.join("shared.mcworld");
+        mcworld::pack(&entry.world_dir, &mcworld).unwrap();
+        let imported = vault.import_mcworld(&mcworld, "20260811-120000").unwrap();
+        assert_eq!(imported.source.as_deref(), Some(SOURCE_FILE));
+
+        let snapshot = vault.snapshots(&entry).first().unwrap().path.clone();
+        let restored = vault.restore_snapshot(&snapshot, "20260811-130000").unwrap();
+        assert_eq!(restored.source.as_deref(), Some(SOURCE_BACKUP));
+
+        // A world saved before the vault recorded any of this stays unknown
+        // rather than being labelled with a guess.
+        let old = vault.library_dir().join(&entry.id).join("meta.json");
+        fs::write(&old, r#"{"origin":"local","past_folders":[]}"#).unwrap();
+        assert_eq!(vault.entry(&entry.id).unwrap().source, None);
 
         let _ = fs::remove_dir_all(&base);
     }
