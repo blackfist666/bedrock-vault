@@ -139,6 +139,9 @@ pub enum Resync {
     /// The world that arrived was identical; nothing was touched.
     Unchanged(LibraryEntry),
     Replaced(LibraryEntry),
+    /// What arrived is a *different* world from the one this entry holds, so
+    /// nothing was touched. Carries the entry that was left alone.
+    NotTheSameWorld(LibraryEntry),
 }
 
 /// What [`Vault::absorb_mcworld`] did with a world that arrived.
@@ -291,6 +294,14 @@ fn read_name_file(dir: &Path) -> Option<String> {
 /// A world's name, from `level.dat` with `levelname.txt` as the fallback.
 pub fn world_display_name(world_dir: &Path) -> Option<String> {
     world_name(world_dir)
+}
+
+/// A world's seed: what identifies it when a name cannot be trusted.
+fn world_seed(world_dir: &Path) -> Option<i64> {
+    fs::read(world_dir.join("level.dat"))
+        .ok()
+        .and_then(|d| level_dat::parse(&d).ok())
+        .and_then(|m| m.seed)
 }
 
 /// A world's name, from `level.dat` with `levelname.txt` as the fallback.
@@ -579,15 +590,22 @@ impl Vault {
         stamp: &str,
         claim: Option<(i64, i64)>,
     ) -> Result<Absorbed> {
+        // Set when the slot already has a copy in the vault and what arrived
+        // was a *different* world. The claim stays where it is: an old occupant
+        // of a slot is not the world on it, so it must not inherit the slot.
+        let mut claim_is_spoken_for = false;
         if let Some((realm_id, slot)) = claim {
             if let Some(held) = self.find_by_realm_slot(realm_id, slot)? {
-                let absorbed = match self.resync_mcworld(&held.id, mcworld, stamp)? {
-                    Resync::Unchanged(entry) => Absorbed::AlreadyHeld(entry),
-                    Resync::Replaced(entry) => Absorbed::Updated(entry),
-                };
-                return Ok(absorbed);
+                match self.resync_mcworld(&held.id, mcworld, stamp)? {
+                    Resync::Unchanged(entry) => return Ok(Absorbed::AlreadyHeld(entry)),
+                    Resync::Replaced(entry) => return Ok(Absorbed::Updated(entry)),
+                    // Not an update of anything — fall through and let it stand
+                    // or be recognised on its own merits.
+                    Resync::NotTheSameWorld(_) => claim_is_spoken_for = true,
+                }
             }
         }
+        let claim = claim.filter(|_| !claim_is_spoken_for);
 
         // Unpacking is the same work as inspecting the archive would be, so the
         // copy is made and then dropped if it turns out to be one the vault has.
@@ -618,6 +636,19 @@ impl Vault {
     /// a world that has not moved on changes nothing at all.
     pub fn resync_mcworld(&self, id: &str, mcworld: &Path, stamp: &str) -> Result<Resync> {
         let entry = self.entry(id)?;
+
+        // The archive a Realm slot hands back is not always that slot's world:
+        // the service serves its own stored copy, which stays as it was until
+        // somebody plays there, so it can be a world that used to be on the
+        // slot. Trusting it replaced one of the player's worlds with a
+        // different one — Maia World became Hardcore Mode — so the seed has to
+        // agree before anything is written. It is the one thing about a world
+        // that cannot be renamed.
+        let arriving = mcworld::seed_in_archive(mcworld);
+        if arriving.is_none() || arriving != world_seed(&entry.world_dir) {
+            return Ok(Resync::NotTheSameWorld(entry));
+        }
+
         let staged = self.library_dir().join(id).join("world.new");
         let _ = fs::remove_dir_all(&staged);
         mcworld::unpack(mcworld, &staged).inspect_err(|_| {
@@ -1603,6 +1634,66 @@ mod tests {
             1,
             "and what it replaced is kept"
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// What went wrong in the wild, reproduced: an entry was the vault's copy
+    /// of a Realm slot, the slot handed back a *different* world — its stored
+    /// copy was a previous occupant, never re-backed up — and that world was
+    /// written over the entry. One player's Maia World became Hardcore Mode.
+    #[test]
+    fn a_slot_serving_a_different_world_never_overwrites_the_entry() {
+        let base = temp("wrongworld");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let mine = base.join("mine");
+        make_world(&mine, "Maia World (10) - Copy");
+        let mine_archive = base.join("mine.mcworld");
+        mcworld::pack(&mine, &mine_archive).unwrap();
+        let held = vault.absorb_mcworld(&mine_archive, "20260811-090000", None).unwrap();
+        let held = held.entry().clone();
+        vault.set_realm_slot(&held.id, 34391948, 2).unwrap();
+
+        // The slot's stored copy is a world that used to be there.
+        let stale = base.join("stale");
+        make_world(&stale, "Hardcore Mode");
+        fs::write(
+            stale.join("level.dat"),
+            level_dat::test_fixtures::synthetic_level_dat_with_seed(-1920971761),
+        )
+        .unwrap();
+        let stale_archive = base.join("stale.mcworld");
+        mcworld::pack(&stale, &stale_archive).unwrap();
+
+        let absorbed = vault
+            .absorb_mcworld(&stale_archive, "20260811-144832", Some((34391948, 2)))
+            .unwrap();
+        assert!(matches!(absorbed, Absorbed::Added(_)), "it is its own world: {absorbed:?}");
+        assert_ne!(absorbed.entry().id, held.id);
+        // And it does not inherit the slot: an old occupant is not the world
+        // on it, so the copy that is stays the slot's.
+        assert_eq!(vault.find_by_realm_slot(34391948, 2).unwrap().map(|e| e.id), Some(held.id.clone()));
+
+        // The claimed entry is untouched — not replaced, and not even
+        // snapshotted. Judged on the seed: both fixtures carry the same
+        // `LevelName`, which is exactly the case a name could not tell apart.
+        let after = vault.entry(&held.id).unwrap();
+        assert_eq!(after.name, held.name);
+        assert_eq!(world_seed(&after.world_dir), world_seed(&mine));
+        assert_ne!(world_seed(&after.world_dir), world_seed(&stale));
+        assert!(vault.snapshots_for_key(&held.id).is_empty());
+
+        // The same world moving on still updates it, which is the point of the
+        // claim in the first place.
+        fs::write(mine.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let moved_on = base.join("mine-later.mcworld");
+        mcworld::pack(&mine, &moved_on).unwrap();
+        let updated = vault
+            .absorb_mcworld(&moved_on, "20260811-150000", Some((34391948, 2)))
+            .unwrap();
+        assert!(matches!(updated, Absorbed::Updated(_)), "{updated:?}");
+        assert_eq!(updated.entry().id, held.id);
 
         let _ = fs::remove_dir_all(&base);
     }
