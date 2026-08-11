@@ -587,6 +587,43 @@ impl Vault {
         out
     }
 
+    /// Delete one backup for good.
+    ///
+    /// The path arrives from the screen, so it is checked against this vault's
+    /// own backups folder first: nothing outside it, and nothing that is not a
+    /// snapshot, can be removed through here. Unlike deleting a world, there is
+    /// no copy left behind — this *is* the copy.
+    pub fn delete_snapshot(&self, snapshot: &Path) -> Result<()> {
+        let backups = self
+            .backups_dir()
+            .canonicalize()
+            .with_context(|| format!("reading {}", self.backups_dir().display()))?;
+        let target = snapshot
+            .canonicalize()
+            .with_context(|| format!("that backup is no longer at {}", snapshot.display()))?;
+        if !target.starts_with(&backups)
+            || target.extension().is_none_or(|x| x != "mcworld")
+            || !target.is_file()
+        {
+            bail!("{} is not a backup in this vault", snapshot.display());
+        }
+        fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
+
+        // Once the last snapshot of a world is gone the folder holds only the
+        // remembered name, which is no use on its own.
+        if let Some(dir) = target.parent().filter(|d| *d != backups) {
+            let empty = fs::read_dir(dir).map(|mut entries| {
+                !entries.any(|e| {
+                    e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "mcworld"))
+                })
+            });
+            if empty.unwrap_or(false) {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+        Ok(())
+    }
+
     fn prune_snapshots(&self, id: &str) -> Result<()> {
         let keep = self.settings.snapshot_retention.max(1);
         let snaps = self.snapshots_for_key(id);
@@ -838,6 +875,35 @@ mod tests {
         assert_eq!(restored.name, "Spike Test World");
         assert_eq!(restored.origin, "restored");
         assert_eq!(vault.list().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deleting_a_backup_removes_that_file_and_nothing_else() {
+        let base = temp("delbackup");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+        let entry = vault.protect(&live, "abc=", "20260811-100000").unwrap();
+        vault.snapshot(&entry.id, &entry.world_dir, "20260811-110000").unwrap();
+
+        let snaps = vault.snapshots_for_key(&entry.id);
+        assert_eq!(snaps.len(), 2);
+        vault.delete_snapshot(&snaps[0].path).unwrap();
+        let left = vault.snapshots_for_key(&entry.id);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].stamp, snaps[1].stamp);
+        assert!(vault.list().unwrap().len() == 1, "the world itself is untouched");
+
+        // Anything outside the vault's backups folder is refused, so a path
+        // coming from the screen can never reach the world itself.
+        assert!(vault.delete_snapshot(&entry.world_dir.join("level.dat")).is_err());
+        assert!(entry.world_dir.join("level.dat").is_file());
+
+        // The last one out takes the folder with it.
+        vault.delete_snapshot(&left[0].path).unwrap();
+        assert!(!vault.backups_dir().join(&entry.id).exists());
 
         let _ = fs::remove_dir_all(&base);
     }

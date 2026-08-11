@@ -451,6 +451,19 @@ async fn restore(path: String) -> Result<String, String> {
     .await
 }
 
+/// Delete one backup for good. The world it came from is not touched.
+#[tauri::command]
+async fn delete_backup(path: String) -> Result<String, String> {
+    blocking(move || {
+        let vault = open_vault()?;
+        vault
+            .delete_snapshot(std::path::Path::new(&path))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok("That backup is gone".to_owned())
+    })
+    .await
+}
+
 /// Import a `.mcworld` file (from Downloads, a Switch export, anywhere).
 #[tauri::command]
 async fn import(path: String) -> Result<String, String> {
@@ -1220,7 +1233,7 @@ fn main() {
         .manage(PendingLogin::default())
         .invoke_handler(tauri::generate_handler![
             overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
-            restore, import, export, open_folder, set_vault_location, realms_overview,
+            restore, delete_backup, import, export, open_folder, set_vault_location, realms_overview,
             realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out,
             realm_download, realm_detail, realm_targets, realm_upload, realm_rename_slot,
             realm_clear_packs, realm_switch_slot, packs_overview, profile, open_url

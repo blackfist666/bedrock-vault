@@ -299,6 +299,17 @@ function backupRows() {
           `The copy from ${b.label} is added to the vault as a separate world, so nothing you have now is changed or lost.`,
           "Yes, restore it", "restore", { path: b.path }),
       }));
+      line.append(button("Delete", {
+        className: TOUCHES.warning,
+        help: "Throw this older copy away. The world itself is not touched.",
+        onClick: () => confirmRun(
+          `Delete the copy of "${g.name}" from ${b.label}?`,
+          "This copy is thrown away for good and cannot be brought back." +
+          (g.backups.length === 1
+            ? ` It is the last copy of "${g.name}" kept in Backups.`
+            : " The other copies are not touched."),
+          "Yes, delete it", "delete_backup", { path: b.path }),
+      }));
       list.append(line);
     }
     main.append(list);
@@ -834,7 +845,8 @@ async function run(cmd, args) {
   const label = {
     save_all: "Saving worlds", save_to_vault: "Saving to the vault", put_away: "Putting away",
     play: "Getting it ready", back_up: "Backing up", export: "Making a copy",
-    restore: "Restoring", delete: "Deleting", import: "Importing",
+    restore: "Restoring", delete: "Deleting", delete_backup: "Deleting that copy",
+    import: "Importing",
     set_vault_location: "Moving the vault", open_folder: "Opening",
     realms_sign_out: "Signing out", realm_download: "Downloading from the Realm",
     realm_upload: "Sending to the Realm", realm_rename_slot: "Renaming",
@@ -1022,7 +1034,7 @@ function confirmRun(title, body, okLabel, cmd, args) {
   // clicked on the row is the colour they confirm with.
   ok.className = `mc-btn ${
     cmd.startsWith("realm_") || cmd.startsWith("realms_") ? TOUCHES.realm
-    : cmd === "delete" || cmd === "realm_clear_packs" ? TOUCHES.warning
+    : cmd === "delete" || cmd === "delete_backup" || cmd === "realm_clear_packs" ? TOUCHES.warning
     : cmd === "put_away" || cmd === "play" ? TOUCHES.minecraft
     : TOUCHES.vault}`;
   ok.style.display = "";
