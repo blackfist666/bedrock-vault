@@ -223,6 +223,10 @@ pub struct Slot {
     pub active: bool,
     /// No world has ever been put here.
     pub empty: bool,
+    /// Artwork for the marketplace template this world was built from, if it
+    /// was. The only picture the service ever offers of a slot — an ordinary
+    /// world has none, and `thumbnailId` is null on every Realm.
+    pub template_image: Option<String>,
 }
 
 /// Every Bedrock Realm has three world slots, whether or not they hold a world.
@@ -273,6 +277,7 @@ pub fn detail(session: &auth::XstsToken, realm_id: i64) -> Result<RealmDetail> {
                     difficulty: None,
                     hardcore: false,
                     seed: None,
+                    template_image: None,
                     pack_ids: Vec::new(),
                     rules: Vec::new(),
                     active: Some(id) == active_slot,
@@ -371,6 +376,7 @@ fn slot_from(v: &serde_json::Value, active_slot: Option<i64>) -> Slot {
         hardcore: options["hardcore"].as_bool().unwrap_or(false)
             || settings.get("IsHardcore").and_then(|v| v.as_bool()).unwrap_or(false),
         seed: settings.get("RandomSeed").and_then(|v| v.as_i64()).map(|n| n.to_string()),
+        template_image: non_empty(options["worldTemplateImage"].as_str()),
         pack_ids,
         rules: dedupe_rules(rules),
         active: Some(slot_id) == active_slot,
@@ -1215,6 +1221,7 @@ mod tests {
             difficulty: None,
             hardcore: false,
             seed: None,
+            template_image: None,
             pack_ids,
             rules: Vec::new(),
             active: false,

@@ -66,23 +66,31 @@ pub fn fetch(identity: &XstsToken) -> Result<Profile> {
     })
 }
 
-/// Download an image and return it as a `data:` URI.
+/// Download the player's picture at avatar size.
 ///
-/// Capped so a surprising response cannot bloat the saved session file.
+/// Xbox serves the raw picture at whatever size is asked for; 128px is plenty
+/// for a header avatar and keeps the cached copy small.
 pub fn fetch_image(url: &str) -> Result<String> {
-    use base64::Engine;
-
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
-
-    // Xbox serves the raw picture at whatever size is asked for; 128px is
-    // plenty for a header avatar and keeps the cached copy small.
     let sized = if url.contains('?') {
         format!("{url}&format=png&w=128&h=128")
     } else {
         format!("{url}?format=png&w=128&h=128")
     };
+    fetch_data_uri(&sized)
+}
 
-    let response = ureq::get(&sized)
+/// Download an image and return it as a `data:` URI.
+///
+/// Everything shown in the window is inlined like this: the webview's content
+/// policy blocks remote images, and it means a picture already on screen keeps
+/// working offline. Capped so a surprising response cannot bloat the page or
+/// the saved session file.
+pub fn fetch_data_uri(url: &str) -> Result<String> {
+    use base64::Engine;
+
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+
+    let response = ureq::get(url)
         .call()
         .map_err(|e| anyhow!("could not download the picture: {e}"))?;
     let content_type = response
