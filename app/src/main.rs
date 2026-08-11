@@ -155,6 +155,46 @@ fn world_packs(world_dir: &std::path::Path, index: &HashMap<String, String>) -> 
     (names, unknown)
 }
 
+/// Pack uuid -> the artwork of the world template that bundles it.
+///
+/// A marketplace template ships the world's own picture. A world built from one
+/// and never played on this PC has no `world_icon.jpeg` of its own — Minecraft
+/// writes that when the world is played — but the template that made it does,
+/// and the world names the template's packs, which is what ties the two
+/// together.
+fn template_pictures() -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (_, cache) in packs::find_premium_caches() {
+        let Ok((found, _)) = packs::scan_premium_cache(&cache) else {
+            continue;
+        };
+        let templates: Vec<&packs::Pack> =
+            found.iter().filter(|p| p.category == "world_templates" && p.icon.is_some()).collect();
+        for pack in found.iter().filter(|p| p.category == "template_embedded") {
+            let Some(template) = templates.iter().find(|t| pack.path.starts_with(&t.path)) else {
+                continue;
+            };
+            if let Some(icon) = &template.icon {
+                out.insert(pack.uuid.replace('-', "").to_lowercase(), icon.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The picture to show for a world: its own, or the template's it was built
+/// from. Never anything invented — a world with neither shows none.
+fn world_picture(world_dir: &std::path::Path, templates: &HashMap<String, String>) -> Option<String> {
+    if let Some(icon) = world_icon(world_dir) {
+        return Some(icon);
+    }
+    let (resource, behavior) = packs::world_pack_refs(world_dir);
+    resource
+        .into_iter()
+        .chain(behavior)
+        .find_map(|r| templates.get(&r.uuid.replace('-', "").to_lowercase()).cloned())
+}
+
 /// A world's `world_icon.jpeg` as a data URI, for the thumbnail in the list.
 ///
 /// Inlined rather than served from disk because the webview's content policy
@@ -204,6 +244,7 @@ async fn game_status() -> Result<Vec<String>, String> {
 
 fn build_overview() -> Result<OverviewDto, String> {
     let index = pack_index();
+    let templates = template_pictures();
     let vault = open_vault()?;
     let library = vault.list().map_err(|e| format!("{e:#}"))?;
 
@@ -246,7 +287,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 },
                 packs: names,
                 missing_packs: missing,
-                icon: world_icon(&dir),
+                icon: world_picture(&dir, &templates),
                 error,
             });
         }
@@ -270,7 +311,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 packs: names,
                 missing_packs: missing,
                 backup_count: vault.snapshots(e).len(),
-                icon: world_icon(&e.world_dir),
+                icon: world_picture(&e.world_dir, &templates),
                 source: e.source.clone(),
             }
         })
@@ -712,6 +753,7 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
         let detail = realms::detail(&session, realm_id).map_err(|e| format!("{e:#}"))?;
         let known = known_packs();
         let by_seed = worlds_by_seed();
+        let templates = template_pictures();
 
         let slots: Vec<SlotDto> = detail
             .slots
@@ -731,7 +773,7 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
                 SlotDto {
                     name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
                     packs: name_slot_packs(&s, &known, &by_seed, marketplace),
-                    icon: slot_picture(&s, &by_seed),
+                    icon: slot_picture(&s, &by_seed, &templates),
                     rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
                     can_backup: stored.is_some(),
                     stored_is_older_world: stored
@@ -829,8 +871,14 @@ fn local_copies<'a>(
 /// one Minecraft draws for it, not an invention. Failing that, a world built
 /// from a marketplace template has the template's artwork, which is the only
 /// image the service itself ever offers.
-fn slot_picture(slot: &realms::Slot, by_seed: &HashMap<String, Vec<PathBuf>>) -> Option<String> {
-    if let Some(icon) = local_copies(slot, by_seed).iter().find_map(|dir| world_icon(dir)) {
+fn slot_picture(
+    slot: &realms::Slot,
+    by_seed: &HashMap<String, Vec<PathBuf>>,
+    templates: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(icon) =
+        local_copies(slot, by_seed).iter().find_map(|dir| world_picture(dir, templates))
+    {
         return Some(icon);
     }
     let url = slot.template_image.as_deref()?;
