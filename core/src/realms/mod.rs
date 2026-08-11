@@ -561,6 +561,13 @@ pub struct StoredWorld {
     /// Pack refs the stored copy carries, sorted. Empty when the token said
     /// nothing — a world with no add-ons, or a token we could not read.
     pub pack_ids: Vec<String>,
+    /// Each pack's Realms-minted ref paired with its real marketplace id.
+    ///
+    /// The ref is the only id a slot reports and it exists nowhere outside
+    /// Realms, which is why a slot's add-ons could not be named. The token
+    /// carries both, and the marketplace id is exactly what this PC's own
+    /// installed content is keyed by.
+    pub marketplace_ids: Vec<(String, String)>,
 }
 
 impl StoredWorld {
@@ -579,20 +586,22 @@ impl StoredWorld {
 /// Ask what the service holds for a slot, without downloading it.
 pub fn stored_world(session: &auth::XstsToken, realm_id: i64, slot: i64) -> Option<StoredWorld> {
     let download = slot_download(session, realm_id, slot, None).ok()?;
-    Some(StoredWorld {
-        size_bytes: download.size_bytes,
-        pack_ids: token_pack_ids(&download.token),
-    })
+    let marketplace_ids = token_packs(&download.token);
+    let mut pack_ids: Vec<String> = marketplace_ids.iter().map(|(r, _)| r.clone()).collect();
+    pack_ids.sort();
+    pack_ids.dedup();
+    Some(StoredWorld { size_bytes: download.size_bytes, pack_ids, marketplace_ids })
 }
 
-/// Pack refs listed inside a download token.
+/// Each pack listed inside a download token, as `(ref, marketplace id)`.
 ///
 /// The token is a JWT; its middle segment is the claim set, which carries the
-/// pack list of the archive it authorises. Nothing is verified — we are reading
-/// a description of a file we are about to fetch anyway, not trusting an
-/// assertion — and anything unreadable comes back empty so the caller simply
-/// learns nothing rather than being told something wrong.
-fn token_pack_ids(token: &str) -> Vec<String> {
+/// pack list of the archive it authorises — each one with both the Realms-minted
+/// `ref` a slot reports and the `packId` the marketplace uses. Nothing is
+/// verified: we are reading a description of a file we are about to fetch
+/// anyway, not trusting an assertion. Anything unreadable comes back empty so
+/// the caller simply learns nothing rather than being told something wrong.
+fn token_packs(token: &str) -> Vec<(String, String)> {
     use base64::Engine;
 
     let Some(payload) = token.split('.').nth(1) else {
@@ -605,15 +614,14 @@ fn token_pack_ids(token: &str) -> Vec<String> {
         return Vec::new();
     };
 
-    let mut ids: Vec<String> = ["resourcePacks", "behaviorPacks"]
+    ["resourcePacks", "behaviorPacks"]
         .iter()
         .filter_map(|key| claims[*key].as_array())
         .flatten()
-        .filter_map(|p| p["ref"].as_str().map(str::to_owned))
-        .collect();
-    ids.sort();
-    ids.dedup();
-    ids
+        .filter_map(|p| {
+            Some((p["ref"].as_str()?.to_owned(), p["packId"].as_str()?.to_owned()))
+        })
+        .collect()
 }
 
 /// Stream a slot's world to disk as a `.mcworld`.
@@ -1234,17 +1242,24 @@ mod tests {
         }
     }
 
+    fn stored_from(claims: serde_json::Value) -> StoredWorld {
+        let marketplace_ids = token_packs(&fake_token(claims));
+        let mut pack_ids: Vec<String> = marketplace_ids.iter().map(|(r, _)| r.clone()).collect();
+        pack_ids.sort();
+        pack_ids.dedup();
+        StoredWorld { size_bytes: 1_908_503, pack_ids, marketplace_ids }
+    }
+
     /// The case from issue #5: the slot shows one world, the service still
     /// holds the previous occupant, and only the token's pack list says so.
     #[test]
     fn a_stale_stored_copy_is_told_apart_by_its_packs() {
-        let stored = StoredWorld {
-            size_bytes: 1_908_503,
-            pack_ids: token_pack_ids(&fake_token(serde_json::json!({
-                "behaviorPacks": [{ "ref": "c5890e78560f4a4c88567abedf8020ef" }],
-                "resourcePacks": [{ "ref": "f29b7376af8646d5a12cb58140ceec6f" }],
-            }))),
-        };
+        let stored = stored_from(serde_json::json!({
+            "behaviorPacks": [{ "ref": "c5890e78560f4a4c88567abedf8020ef",
+                                "packId": "216a35d5-e038-4c52-b531-71670c3e219a" }],
+            "resourcePacks": [{ "ref": "f29b7376af8646d5a12cb58140ceec6f",
+                                "packId": "c46327e2-fa4b-4c6d-bc7e-13abc579d54f" }],
+        }));
         assert_eq!(stored.pack_ids.len(), 2);
 
         let on_the_slot = slot_with_packs(&[
@@ -1264,14 +1279,51 @@ mod tests {
     /// compare, and an unreadable token must not read as "different world".
     #[test]
     fn nothing_to_compare_answers_unknown() {
-        let empty = StoredWorld { size_bytes: 0, pack_ids: Vec::new() };
+        let empty =
+            StoredWorld { size_bytes: 0, pack_ids: Vec::new(), marketplace_ids: Vec::new() };
         assert_eq!(empty.matches_slot(&slot_with_packs(&["a"])), None);
 
-        let stored = StoredWorld { size_bytes: 0, pack_ids: vec!["a".into()] };
+        let stored = StoredWorld {
+            size_bytes: 0,
+            pack_ids: vec!["a".into()],
+            marketplace_ids: Vec::new(),
+        };
         assert_eq!(stored.matches_slot(&slot_with_packs(&[])), None);
 
         for rubbish in ["", "not.a.token", "a.!!!not-base64!!!.c", "a.e30.c"] {
-            assert!(token_pack_ids(rubbish).is_empty(), "{rubbish}");
+            assert!(token_packs(rubbish).is_empty(), "{rubbish}");
         }
+    }
+
+    /// The ids a slot reports exist only inside Realms; the token is what pairs
+    /// them with the marketplace ids this PC's installed packs are keyed by.
+    #[test]
+    fn the_token_pairs_a_slot_id_with_the_marketplace_id() {
+        let stored = stored_from(serde_json::json!({
+            "behaviorPacks": [{ "ref": "151219c841334889b16c4daca429d50d",
+                                "packId": "ffc5f3ad-11b0-4551-b80e-4e7cdd22993c" }],
+            "resourcePacks": [
+                { "ref": "131023e82e9243789de808021e4bbe9c",
+                  "packId": "5aaa8b16-cf1e-4abe-9202-3f749bd89501" },
+                { "ref": "67f6ea41545b48cd90d8a42b81b7239e",
+                  "packId": "9183af09-928c-45b7-9344-4c182cafdd81" },
+            ],
+        }));
+        assert_eq!(stored.marketplace_ids.len(), 3);
+        assert_eq!(
+            stored
+                .marketplace_ids
+                .iter()
+                .find(|(minted, _)| minted == "151219c841334889b16c4daca429d50d")
+                .map(|(_, real)| real.as_str()),
+            Some("ffc5f3ad-11b0-4551-b80e-4e7cdd22993c")
+        );
+
+        // A pack the token describes without a marketplace id is no use and is
+        // left out rather than paired with something invented.
+        let partial = stored_from(serde_json::json!({
+            "resourcePacks": [{ "ref": "abc" }, { "ref": "def", "packId": "real-id" }],
+        }));
+        assert_eq!(partial.marketplace_ids, vec![("def".to_owned(), "real-id".to_owned())]);
     }
 }

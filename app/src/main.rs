@@ -724,9 +724,13 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
                 } else {
                     realms::stored_world(&session, realm_id, s.slot_id)
                 };
+                let marketplace = stored
+                    .as_ref()
+                    .map(|st| st.marketplace_ids.as_slice())
+                    .unwrap_or(&[]);
                 SlotDto {
                     name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
-                    packs: name_slot_packs(&s, &known, &by_seed),
+                    packs: name_slot_packs(&s, &known, &by_seed, marketplace),
                     icon: slot_picture(&s, &by_seed),
                     rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
                     can_backup: stored.is_some(),
@@ -835,15 +839,25 @@ fn slot_picture(slot: &realms::Slot, by_seed: &HashMap<String, Vec<PathBuf>>) ->
 
 /// Put names to a slot's add-ons.
 ///
-/// Realms mints its own ids for packs attached to a slot; they appear nowhere
-/// locally and no endpoint resolves them. But if a copy of that world is held
-/// here — matched on the seed the slot reports — the world's own pack history
-/// names them, and their order matches the slot's. Where that fails, the kind
-/// of pack is still known, so it says "Resource pack" rather than pretending.
+/// Realms mints its own ids for packs attached to a slot, and they appear
+/// nowhere locally. Three sources, best first:
+///
+/// 1. the slot's download token, which pairs each minted id with the pack's
+///    real marketplace id — the one this PC's installed content is keyed by, so
+///    it brings the proper name *and* the artwork;
+/// 2. a copy of the world held here, matched on the seed the slot reports,
+///    whose own pack history names its add-ons in the slot's order;
+/// 3. nothing, which says "Add-on" rather than pretending.
+///
+/// The token describes the *stored* copy of a slot, which can be a world that
+/// used to be there (see #5) — but its ids are only ever consulted for ids the
+/// slot itself lists, so a stored copy of some other world matches nothing and
+/// names nothing.
 fn name_slot_packs(
     slot: &realms::Slot,
     known: &HashMap<String, (String, Option<String>)>,
     by_seed: &HashMap<String, Vec<PathBuf>>,
+    marketplace: &[(String, String)],
 ) -> Vec<PackRefDto> {
     let from_world: Vec<String> = local_copies(slot, by_seed)
         .iter()
@@ -858,11 +872,24 @@ fn name_slot_packs(
         .find(|names: &Vec<String>| !names.is_empty())
         .unwrap_or_default();
 
+    // uuids are written with and without dashes and in either case; compare on
+    // one shape so a match is never missed on punctuation.
+    let key = |id: &str| id.replace('-', "").to_lowercase();
+    let installed = |id: &str| known.get(&key(id)).or_else(|| known.get(&id.replace('-', "")));
+
     slot.pack_ids
         .iter()
         .enumerate()
         .map(|(i, id)| {
-            if let Some(p) = known.get(&id.replace('-', "")) {
+            if let Some(p) = installed(id) {
+                return PackRefDto { name: p.0.clone(), icon: p.1.clone(), installed: true };
+            }
+            // The same pack under the id the marketplace knows it by.
+            if let Some(p) = marketplace
+                .iter()
+                .find(|(minted, _)| key(minted) == key(id))
+                .and_then(|(_, real)| installed(real))
+            {
                 return PackRefDto { name: p.0.clone(), icon: p.1.clone(), installed: true };
             }
             match from_world.get(i).or_else(|| from_world.first()) {
