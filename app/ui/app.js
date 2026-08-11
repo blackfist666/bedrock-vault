@@ -751,6 +751,10 @@ async function loadRealmTargets() {
   }
 }
 
+/// Ask the Realms service what is on each Realm now.
+///
+/// Nothing here is cached between calls, so this is also the refresh: the
+/// per-Realm detail is dropped so each hero fetches its slots again.
 async function loadRealms() {
   try {
     state.realms = await invoke("realms_overview");
@@ -763,9 +767,29 @@ async function loadRealms() {
     state.profile = r.profile || state.profile;
     state.realmTargets = r.mine;
     renderAccount();
+    return true;
   } catch (e) {
     banner(String(e), "error");
+    return false;
   }
+}
+
+/// The Refresh button on the Realms page.
+///
+/// A Realm changes while the app is open — someone loads a different world on
+/// it from inside Minecraft, or makes a new one — and nothing tells the app
+/// that happened, so this is how the page catches up without a restart.
+async function refreshRealms() {
+  if (state.busy) return;
+  state.busy = true;
+  render();
+  showProgress("Checking your Realms…", 0, 0);
+  const ok = await loadRealms();
+  state.busy = false;
+  hideProgress();
+  // A Realm that answered but reported a problem shows it in the list itself.
+  if (ok && !state.realms?.error) banner("Your Realms are up to date", "ok");
+  render();
 }
 
 function render() {
@@ -788,6 +812,14 @@ function render() {
     grid.append(el("div", "empty", state.search ? "Nothing matches that name." : empty));
   }
   for (const r of rows) grid.append(r);
+
+  // Only the Realms page has something to re-read from a server; the Packs
+  // page carries its own Refresh as the main action.
+  const refresh = document.getElementById("refresh-action");
+  const canRefresh = state.section === "realms" && state.realms?.signed_in && !state.login;
+  refresh.style.display = canRefresh ? "" : "none";
+  refresh.disabled = state.busy;
+  refresh.onclick = refreshRealms;
 
   const main = document.getElementById("main-action");
   main.style.display = "";
