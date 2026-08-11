@@ -133,6 +133,17 @@ header {
 .slot-head { display: flex; align-items: center; gap: 8px; }
 .slot-num { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
 .slot-name { font-size: 15px; font-weight: 600; }
+
+/* The world's own picture, across the top of the card. Cropped rather than
+   letterboxed: a Minecraft world icon is 16:9 already, but a marketplace
+   template's artwork is square. */
+.slot-shot {
+  width: 100%;
+  height: 108px;
+  object-fit: cover;
+  border: 2px solid var(--line);
+  background: #17181a;
+}
 .slot-rules { font-size: 11.5px; color: #7f8085; line-height: 1.6; }
 .slot-packs { display: flex; flex-direction: column; gap: 5px; }
 

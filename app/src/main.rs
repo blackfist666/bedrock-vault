@@ -539,6 +539,9 @@ struct SlotDto {
     /// Pack names where installed locally, otherwise a short id.
     packs: Vec<PackRefDto>,
     rules: Vec<[String; 2]>,
+    /// The world's own picture, from a copy of it held on this PC, or the
+    /// artwork of the marketplace template it was built from.
+    icon: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -699,6 +702,7 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
                 SlotDto {
                     name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
                     packs: name_slot_packs(&s, &known, &by_seed),
+                    icon: slot_picture(&s, &by_seed),
                     rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
                     can_backup: stored.is_some(),
                     stored_is_older_world: stored
@@ -743,19 +747,21 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
     .await
 }
 
-/// World seed -> a copy of that world held here.
+/// World seed -> every copy of that world held here.
 ///
 /// A Realm slot reports its seed, which identifies which world is on it far
-/// more reliably than a name that anyone can change.
-fn worlds_by_seed() -> HashMap<String, PathBuf> {
-    let mut index = HashMap::new();
+/// more reliably than a name that anyone can change. All the copies are kept,
+/// not just the first: the same world can sit in the vault and in the game at
+/// once, and only one of them may carry the picture or the pack history.
+fn worlds_by_seed() -> HashMap<String, Vec<PathBuf>> {
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut note = |dir: PathBuf| {
         if let Some(seed) = std::fs::read(dir.join("level.dat"))
             .ok()
             .and_then(|d| bedrock_vault_core::level_dat::parse(&d).ok())
             .and_then(|m| m.seed)
         {
-            index.entry(seed.to_string()).or_insert(dir);
+            index.entry(seed.to_string()).or_default().push(dir);
         }
     };
     if let Ok(vault) = open_vault() {
@@ -773,6 +779,35 @@ fn worlds_by_seed() -> HashMap<String, PathBuf> {
     index
 }
 
+/// Copies of a slot's world held on this PC, matched on the seed.
+fn local_copies<'a>(
+    slot: &realms::Slot,
+    by_seed: &'a HashMap<String, Vec<PathBuf>>,
+) -> &'a [PathBuf] {
+    slot.seed
+        .as_ref()
+        .and_then(|seed| by_seed.get(seed))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// A picture for a Realm slot, best first.
+///
+/// Nothing Mojang serves shows what a Realm world looks like: `thumbnailId` is
+/// null on every Realm, and the archive a slot hands over has no
+/// `world_icon.jpeg` in it. But a world played on this PC has one, and a slot's
+/// seed says which local world is the same world — so the picture is the real
+/// one Minecraft draws for it, not an invention. Failing that, a world built
+/// from a marketplace template has the template's artwork, which is the only
+/// image the service itself ever offers.
+fn slot_picture(slot: &realms::Slot, by_seed: &HashMap<String, Vec<PathBuf>>) -> Option<String> {
+    if let Some(icon) = local_copies(slot, by_seed).iter().find_map(|dir| world_icon(dir)) {
+        return Some(icon);
+    }
+    let url = slot.template_image.as_deref()?;
+    realms::profile::fetch_data_uri(url).ok()
+}
+
 /// Put names to a slot's add-ons.
 ///
 /// Realms mints its own ids for packs attached to a slot; they appear nowhere
@@ -783,12 +818,10 @@ fn worlds_by_seed() -> HashMap<String, PathBuf> {
 fn name_slot_packs(
     slot: &realms::Slot,
     known: &HashMap<String, (String, Option<String>)>,
-    by_seed: &HashMap<String, PathBuf>,
+    by_seed: &HashMap<String, Vec<PathBuf>>,
 ) -> Vec<PackRefDto> {
-    let from_world: Vec<String> = slot
-        .seed
-        .as_ref()
-        .and_then(|seed| by_seed.get(seed))
+    let from_world: Vec<String> = local_copies(slot, by_seed)
+        .iter()
         .map(|dir| {
             let mut names: Vec<String> = packs::names_from_history(dir)
                 .into_iter()
@@ -797,6 +830,7 @@ fn name_slot_packs(
             names.dedup();
             names
         })
+        .find(|names: &Vec<String>| !names.is_empty())
         .unwrap_or_default();
 
     slot.pack_ids

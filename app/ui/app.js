@@ -409,6 +409,14 @@ function realmHero(realm) {
       continue;
     }
 
+    // Only shown when there is a real picture of this world to show: a copy of
+    // it on this PC, or the artwork of the template it was built from.
+    if (slot.icon) {
+      const shot = el("img", "slot-shot");
+      shot.src = slot.icon;
+      shot.alt = "";
+      s.append(shot);
+    }
     s.append(el("div", "slot-name", slot.name));
 
     const facts = el("div", "chips");
