@@ -126,6 +126,23 @@ struct Meta {
     /// unchanged world is not stored again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snapshot_fingerprint: Option<String>,
+    /// `<realm id>/<slot>` this world was last copied down from, so copying
+    /// that slot again lands here instead of making a second entry. The same
+    /// job `origin_folder` does for a world that lives in the game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    realm_slot: Option<String>,
+}
+
+/// What a re-sync did, so the screen can say which.
+#[derive(Debug, Clone)]
+pub enum Resync {
+    /// The world that arrived was identical; nothing was touched.
+    Unchanged(LibraryEntry),
+    Replaced(LibraryEntry),
+}
+
+fn realm_slot_key(realm_id: i64, slot: i64) -> String {
+    format!("{realm_id}/{slot}")
 }
 
 /// A content fingerprint of a world folder: every file's path and bytes.
@@ -190,6 +207,8 @@ pub struct LibraryEntry {
     /// Where this copy last came from or last went: one of [`SOURCES`], or
     /// `None` for a world last touched before the vault recorded it.
     pub source: Option<String>,
+    /// `<realm id>/<slot>` this world was last copied down from.
+    pub realm_slot: Option<String>,
     pub synced_at: Option<i64>,
     /// `LastPlayed` of the source when this copy was taken.
     pub source_last_played: Option<i64>,
@@ -360,6 +379,7 @@ impl Vault {
                 origin_folder: meta.origin_folder,
                 origin: meta.origin,
                 source: meta.source,
+                realm_slot: meta.realm_slot,
                 synced_at: meta.synced_at,
                 source_last_played: meta.source_last_played,
                 past_folders: meta.past_folders,
@@ -518,6 +538,121 @@ impl Vault {
         self.finish_import(&id, "imported")
     }
 
+    /// Take a `.mcworld` into the entry that already holds this world.
+    ///
+    /// Copying the same world in twice used to leave two identical entries,
+    /// because every import minted a fresh id. Saving from Minecraft has never
+    /// behaved that way — it finds the entry by the world's game folder and
+    /// re-syncs it — and this is the same idea for a world arriving as a file:
+    /// the caller says which entry it belongs to, and the vault updates that
+    /// one, keeping what was there as a backup first.
+    ///
+    /// The staged copy is compared before anything is disturbed, so a repeat of
+    /// a world that has not moved on changes nothing at all.
+    pub fn resync_mcworld(&self, id: &str, mcworld: &Path, stamp: &str) -> Result<Resync> {
+        let entry = self.entry(id)?;
+        let staged = self.library_dir().join(id).join("world.new");
+        let _ = fs::remove_dir_all(&staged);
+        mcworld::unpack(mcworld, &staged).inspect_err(|_| {
+            let _ = fs::remove_dir_all(&staged);
+        })?;
+
+        let arriving = fingerprint(&staged);
+        let held = fingerprint(&entry.world_dir);
+        if !arriving.is_empty() && arriving == held {
+            let _ = fs::remove_dir_all(&staged);
+            return Ok(Resync::Unchanged(entry));
+        }
+
+        // Keep what is being replaced, exactly as a re-save from the game does.
+        self.snapshot(id, &entry.world_dir, stamp)?;
+        fs::remove_dir_all(&entry.world_dir)?;
+        fs::rename(&staged, &entry.world_dir)?;
+
+        let mut meta = self.read_meta(id);
+        meta.synced_at = Some(now());
+        meta.size_bytes = Some(scan::dir_size(&entry.world_dir));
+        self.write_meta(id, &meta)?;
+        Ok(Resync::Replaced(self.entry(id)?))
+    }
+
+    /// The entry holding the world last copied down from this Realm slot.
+    ///
+    /// Provenance, not guesswork: a re-download of the same slot lands on the
+    /// entry it made last time, and a download from anywhere else never does.
+    /// Worlds that merely look alike — two playthroughs of one marketplace map,
+    /// sharing a seed and a name — are left well alone.
+    pub fn find_by_realm_slot(&self, realm_id: i64, slot: i64) -> Result<Option<LibraryEntry>> {
+        let want = realm_slot_key(realm_id, slot);
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|e| e.realm_slot.as_deref() == Some(want.as_str())))
+    }
+
+    /// Record that this entry is the vault's copy of a Realm slot.
+    ///
+    /// Exactly one entry may claim a slot, so the claim moves rather than being
+    /// shared: sending a different world up to a slot makes *that* world the
+    /// one the slot holds, and the world that used to be there is no longer a
+    /// copy of it.
+    pub fn set_realm_slot(&self, id: &str, realm_id: i64, slot: i64) -> Result<()> {
+        let key = realm_slot_key(realm_id, slot);
+        for other in self.list()? {
+            if other.id != id && other.realm_slot.as_deref() == Some(key.as_str()) {
+                let mut meta = self.read_meta(&other.id);
+                meta.realm_slot = None;
+                self.write_meta(&other.id, &meta)?;
+            }
+        }
+        let mut meta = self.read_meta(id);
+        meta.realm_slot = Some(key);
+        self.write_meta(id, &meta)
+    }
+
+    /// An entry whose world is byte-for-byte what is in this folder.
+    ///
+    /// For a world arriving as a file, where there is no provenance to go on:
+    /// identical content is the one claim that needs no judgement. Name and
+    /// size narrow the field first so this fingerprints one or two worlds
+    /// rather than the whole library. `except` is the entry being checked,
+    /// which would otherwise match itself.
+    pub fn find_same_content(
+        &self,
+        world_dir: &Path,
+        except: &str,
+    ) -> Result<Option<LibraryEntry>> {
+        let arriving = fingerprint(world_dir);
+        if arriving.is_empty() {
+            return Ok(None);
+        }
+        let name = world_name(world_dir);
+        let (_, bytes) = count_and_size(world_dir);
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|e| e.id != except && Some(&e.name) == name.as_ref() && e.size_bytes == bytes)
+            .find(|e| fingerprint(&e.world_dir) == arriving))
+    }
+
+    /// Remove a library entry, keeping nothing.
+    ///
+    /// For a copy that should not have been made — an import of a world the
+    /// vault already holds. [`Vault::delete`] is the one that leaves a final
+    /// snapshot behind; this deliberately is not, because the world it is
+    /// removing still exists under another id.
+    pub fn forget(&self, id: &str) -> Result<()> {
+        if id.is_empty() || Path::new(id).components().count() != 1 {
+            bail!("'{id}' is not a vault id");
+        }
+        let dir = self.library_dir().join(id);
+        if !dir.join("world").join("level.dat").is_file() {
+            bail!("no vault world '{id}'");
+        }
+        fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        Ok(())
+    }
+
     /// Rebuild a world from a snapshot as a **new** library entry.
     ///
     /// Non-destructive by design: rolling back never overwrites the current
@@ -549,6 +684,7 @@ impl Vault {
             size_bytes: Some(scan::dir_size(&entry.world_dir)),
             past_folders: Vec::new(),
             snapshot_fingerprint: None,
+            realm_slot: None,
         };
         self.write_meta(id, &meta)?;
         self.entry(id)
@@ -1290,6 +1426,102 @@ mod tests {
         // Two, not three: archiving re-saved a world that had not changed, and
         // the copy of it already in history is the same bytes.
         assert_eq!(vault.snapshots(&archived).len(), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The reported case: copying one Realm slot twice left two identical
+    /// worlds in the vault.
+    #[test]
+    fn copying_a_realm_slot_again_updates_the_world_it_made() {
+        let base = temp("realmresync");
+        let live = base.join("w");
+        make_world(&live, "Hardcore Mode");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let download = base.join("slot.mcworld");
+        mcworld::pack(&live, &download).unwrap();
+        let first = vault.import_mcworld(&download, "20260811-131714").unwrap();
+        vault.set_realm_slot(&first.id, 34391948, 2).unwrap();
+
+        // The same slot again, nothing played in between.
+        let held = vault.find_by_realm_slot(34391948, 2).unwrap().expect("the slot's world");
+        assert_eq!(held.id, first.id);
+        match vault.resync_mcworld(&held.id, &download, "20260811-134109").unwrap() {
+            Resync::Unchanged(entry) => assert_eq!(entry.id, first.id),
+            other => panic!("an identical world must change nothing: {other:?}"),
+        }
+        assert_eq!(vault.list().unwrap().len(), 1, "no second copy of one world");
+        assert!(
+            vault.snapshots_for_key(&first.id).is_empty(),
+            "and nothing worth backing up happened"
+        );
+
+        // Played on the Realm since: the same entry moves on, and what it held
+        // is kept.
+        fs::write(live.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let newer = base.join("slot-later.mcworld");
+        mcworld::pack(&live, &newer).unwrap();
+        match vault.resync_mcworld(&first.id, &newer, "20260811-140000").unwrap() {
+            Resync::Replaced(entry) => assert_eq!(entry.id, first.id),
+            other => panic!("a changed world must replace the copy: {other:?}"),
+        }
+        assert_eq!(vault.list().unwrap().len(), 1);
+        assert_eq!(
+            fs::read(first.world_dir.join("db").join("CURRENT")).unwrap(),
+            b"MANIFEST-000002\n"
+        );
+        assert_eq!(
+            vault.snapshots_for_key(&first.id).len(),
+            1,
+            "the copy that was replaced is kept as a backup"
+        );
+
+        // A different slot is a different world, however alike it looks.
+        assert!(vault.find_by_realm_slot(34391948, 3).unwrap().is_none());
+
+        // Sending a different world up to that slot moves the claim, so only
+        // ever one world is the vault's copy of a slot.
+        let other = vault.import_mcworld(&newer, "20260811-150000").unwrap();
+        vault.set_realm_slot(&other.id, 34391948, 2).unwrap();
+        assert_eq!(vault.find_by_realm_slot(34391948, 2).unwrap().map(|e| e.id), Some(other.id));
+        assert_eq!(vault.entry(&first.id).unwrap().realm_slot, None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A file carries no provenance, so only identical content counts.
+    #[test]
+    fn an_identical_import_is_recognised_and_a_different_one_is_not() {
+        let base = temp("sameimport");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let mcworld = base.join("shared.mcworld");
+        mcworld::pack(&live, &mcworld).unwrap();
+        let first = vault.import_mcworld(&mcworld, "20260811-100000").unwrap();
+        let second = vault.import_mcworld(&mcworld, "20260811-110000").unwrap();
+
+        let held = vault.find_same_content(&second.world_dir, &second.id).unwrap();
+        assert_eq!(held.map(|e| e.id), Some(first.id.clone()));
+
+        vault.forget(&second.id).unwrap();
+        assert_eq!(vault.list().unwrap().len(), 1);
+        assert!(!vault.library_dir().join(&second.id).exists());
+        assert!(
+            vault.snapshots_for_key(&second.id).is_empty(),
+            "forgetting a copy leaves no backup: the world is still here"
+        );
+
+        // A world that only looks similar is left alone.
+        fs::write(first.world_dir.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let changed = vault.import_mcworld(&mcworld, "20260811-120000").unwrap();
+        assert!(vault.find_same_content(&changed.world_dir, &changed.id).unwrap().is_none());
+
+        // And a vault id is the only thing `forget` will touch.
+        assert!(vault.forget("../library").is_err());
+        assert!(vault.forget("").is_err());
 
         let _ = fs::remove_dir_all(&base);
     }
