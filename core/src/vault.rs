@@ -141,6 +141,25 @@ pub enum Resync {
     Replaced(LibraryEntry),
 }
 
+/// What [`Vault::absorb_mcworld`] did with a world that arrived.
+#[derive(Debug, Clone)]
+pub enum Absorbed {
+    /// The vault already held this exact world; nothing was added.
+    AlreadyHeld(LibraryEntry),
+    /// The world this entry holds had moved on, so its copy was brought up to
+    /// date and what it held before was kept as a backup.
+    Updated(LibraryEntry),
+    Added(LibraryEntry),
+}
+
+impl Absorbed {
+    pub fn entry(&self) -> &LibraryEntry {
+        match self {
+            Absorbed::AlreadyHeld(e) | Absorbed::Updated(e) | Absorbed::Added(e) => e,
+        }
+    }
+}
+
 fn realm_slot_key(realm_id: i64, slot: i64) -> String {
     format!("{realm_id}/{slot}")
 }
@@ -536,6 +555,54 @@ impl Vault {
             let _ = fs::remove_dir_all(self.library_dir().join(&id));
         })?;
         self.finish_import(&id, "imported")
+    }
+
+    /// Take a `.mcworld` into the vault without ever storing the same world
+    /// twice.
+    ///
+    /// Every way a world arrives as a file goes through here, because each of
+    /// them minted a fresh entry on its own and the vault filled up with
+    /// identical worlds — five copies of one, from replacing a Realm slot three
+    /// times over.
+    ///
+    /// Two checks, in order of how much they know:
+    ///
+    /// 1. `claim` — the Realm slot this world is coming from. The entry that
+    ///    claims it is this world's, so it is updated rather than joined.
+    /// 2. Identical content, which needs no provenance at all: if the vault
+    ///    already holds these exact bytes, nothing is added. A world that
+    ///    differs in any way is a world worth keeping, and is added as its own
+    ///    entry.
+    pub fn absorb_mcworld(
+        &self,
+        mcworld: &Path,
+        stamp: &str,
+        claim: Option<(i64, i64)>,
+    ) -> Result<Absorbed> {
+        if let Some((realm_id, slot)) = claim {
+            if let Some(held) = self.find_by_realm_slot(realm_id, slot)? {
+                let absorbed = match self.resync_mcworld(&held.id, mcworld, stamp)? {
+                    Resync::Unchanged(entry) => Absorbed::AlreadyHeld(entry),
+                    Resync::Replaced(entry) => Absorbed::Updated(entry),
+                };
+                return Ok(absorbed);
+            }
+        }
+
+        // Unpacking is the same work as inspecting the archive would be, so the
+        // copy is made and then dropped if it turns out to be one the vault has.
+        let fresh = self.import_mcworld(mcworld, stamp)?;
+        if let Some(held) = self.find_same_content(&fresh.world_dir, &fresh.id)? {
+            self.forget(&fresh.id)?;
+            if let Some((realm_id, slot)) = claim {
+                self.set_realm_slot(&held.id, realm_id, slot)?;
+            }
+            return Ok(Absorbed::AlreadyHeld(self.entry(&held.id)?));
+        }
+        if let Some((realm_id, slot)) = claim {
+            self.set_realm_slot(&fresh.id, realm_id, slot)?;
+        }
+        Ok(Absorbed::Added(self.entry(&fresh.id)?))
     }
 
     /// Take a `.mcworld` into the entry that already holds this world.
@@ -1486,6 +1553,56 @@ mod tests {
         vault.set_realm_slot(&other.id, 34391948, 2).unwrap();
         assert_eq!(vault.find_by_realm_slot(34391948, 2).unwrap().map(|e| e.id), Some(other.id));
         assert_eq!(vault.entry(&first.id).unwrap().realm_slot, None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The reported case: swapping a Realm's world three times left five
+    /// identical copies of one world in the vault. Each replacement saved the
+    /// slot's current world first, and the service kept handing back the same
+    /// archive — its stored copy of a slot only changes when somebody plays
+    /// there — so every swap imported a world the vault already had.
+    #[test]
+    fn absorbing_the_same_world_repeatedly_adds_it_once() {
+        let base = temp("absorb");
+        let live = base.join("w");
+        make_world(&live, "Hardcore Mode");
+        let vault = Vault::open(base.join("vault")).unwrap();
+        let download = base.join("slot.mcworld");
+        mcworld::pack(&live, &download).unwrap();
+
+        // No claim recorded — how the copies in the wild were made.
+        let first = vault.absorb_mcworld(&download, "20260811-140012", None).unwrap();
+        assert!(matches!(first, Absorbed::Added(_)));
+        for stamp in ["20260811-140053", "20260811-140118", "20260811-140200"] {
+            match vault.absorb_mcworld(&download, stamp, None).unwrap() {
+                Absorbed::AlreadyHeld(entry) => assert_eq!(entry.id, first.entry().id),
+                other => panic!("identical bytes must not be stored again: {other:?}"),
+            }
+        }
+        assert_eq!(vault.list().unwrap().len(), 1, "one world, one entry");
+
+        // A world that differs in any way is a world worth keeping.
+        fs::write(live.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let moved_on = base.join("slot-later.mcworld");
+        mcworld::pack(&live, &moved_on).unwrap();
+        let added = vault.absorb_mcworld(&moved_on, "20260811-150000", None).unwrap();
+        assert!(matches!(added, Absorbed::Added(_)), "no claim, so it stands alone");
+        assert_eq!(vault.list().unwrap().len(), 2);
+
+        // With a claim, the same arrival updates the slot's world instead.
+        vault.set_realm_slot(first.entry().id.as_str(), 34391948, 2).unwrap();
+        let updated = vault
+            .absorb_mcworld(&moved_on, "20260811-160000", Some((34391948, 2)))
+            .unwrap();
+        assert!(matches!(updated, Absorbed::Updated(_)));
+        assert_eq!(updated.entry().id, first.entry().id);
+        assert_eq!(vault.list().unwrap().len(), 2, "updated, not added");
+        assert_eq!(
+            vault.snapshots_for_key(&first.entry().id).len(),
+            1,
+            "and what it replaced is kept"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
