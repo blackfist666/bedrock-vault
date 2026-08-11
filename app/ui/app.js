@@ -223,6 +223,20 @@ function liveRows() {
   });
 }
 
+/// Where a vault world last came from, or last went — in the same colours the
+/// buttons use for those places. Worlds last touched before the vault started
+/// recording this get no chip rather than a guess.
+const SOURCE_CHIPS = {
+  minecraft: { text: "MC", kind: "mode" },
+  realm: { text: "REALM", kind: "realm" },
+  file: { text: "FILE", kind: "" },
+  backup: { text: "BACKUP", kind: "" },
+};
+
+function sourceChip(source) {
+  return SOURCE_CHIPS[source] || null;
+}
+
 function vaultRows() {
   const blocked = state.data.game_running.length > 0;
   const reason = "Close Minecraft first";
@@ -267,6 +281,7 @@ function vaultRows() {
       name: w.name,
       chips: [
         { text: w.mode, kind: "mode" },
+        sourceChip(w.source),
         w.in_game ? { text: "In Minecraft now", kind: "live" } : null,
         w.backup_count ? { text: `${w.backup_count} backup${w.backup_count > 1 ? "s" : ""}` } : null,
         w.missing_packs ? { text: `${w.missing_packs} add-on${w.missing_packs > 1 ? "s" : ""} missing`, kind: "warn" } : null,

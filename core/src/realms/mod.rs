@@ -845,7 +845,9 @@ pub fn replace_slot_world(
             .import_mcworld(&temp_backup, stamp)
             .context("saving the Realm's current world into the vault")?;
         std::fs::remove_file(&temp_backup).ok();
-        Some(entry)
+        // It arrived as a file, but it came off a Realm; say so on the row.
+        vault.set_source(&entry.id, crate::vault::SOURCE_REALM)?;
+        Some(vault.entry(&entry.id).unwrap_or(entry))
     } else {
         // Only for a slot that holds nothing: there is no world to lose.
         None

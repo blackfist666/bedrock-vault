@@ -313,6 +313,8 @@ header {
 }
 
 .chip.mode { color: #cfe8c4; }
+/* Purple for a Realm, matching the buttons that send a world to one. */
+.chip.realm { color: #d6c2f0; border-color: #4b3a67; }
 .chip.saved { color: #a8dcb5; border-color: #2f5a1a; }
 .chip.unsaved { color: #f2ddb4; border-color: #6b5320; }
 .chip.warn { color: var(--amber); border-color: #6b5320; }
