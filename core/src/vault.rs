@@ -214,6 +214,35 @@ pub struct BackupGroup {
     pub snapshots: Vec<Snapshot>,
 }
 
+/// What decides that two backup folders hold the same world: its seed and the
+/// name stored with the snapshots.
+///
+/// Seed alone is not enough — every copy of a marketplace map shares one — and
+/// name alone is the thing `all_backups` has always refused, since plenty of
+/// people have three worlds called "My World". Together they are as close to an
+/// identity as a Bedrock world has: nothing in `level.dat` is unique per world.
+///
+/// The seed is written beside the snapshots when they are taken; older folders
+/// pay one archive read and then cache it the same way.
+fn world_identity(dirs: &[PathBuf], snapshots: &[Snapshot]) -> Option<(i64, String)> {
+    let seed = dirs
+        .iter()
+        .find_map(|d| fs::read_to_string(d.join("seed.txt")).ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .or_else(|| {
+            let found = mcworld::seed_in_archive(&snapshots.first()?.path)?;
+            if let Some(dir) = dirs.first() {
+                let _ = fs::write(dir.join("seed.txt"), found.to_string());
+            }
+            Some(found)
+        })?;
+    let name = dirs
+        .iter()
+        .find_map(|d| read_name_file(d))
+        .or_else(|| mcworld::name_in_archive(&snapshots.first()?.path))?;
+    Some((seed, name))
+}
+
 fn read_name_file(dir: &Path) -> Option<String> {
     fs::read_to_string(dir.join("name.txt"))
         .ok()
@@ -573,9 +602,17 @@ impl Vault {
         let out = dir.join(format!("{stamp}.mcworld"));
         mcworld::pack(world_dir, &out)?;
         // Remember the world's name so backups stay identifiable after the
-        // world itself is deleted from the vault.
+        // world itself is deleted from the vault, and its seed so copies of the
+        // same world can be recognised without opening an archive.
         if let Some(name) = world_name(world_dir) {
             let _ = fs::write(dir.join("name.txt"), name);
+        }
+        if let Some(seed) = fs::read(world_dir.join("level.dat"))
+            .ok()
+            .and_then(|d| level_dat::parse(&d).ok())
+            .and_then(|m| m.seed)
+        {
+            let _ = fs::write(dir.join("seed.txt"), seed.to_string());
         }
         Ok(out)
     }
@@ -621,7 +658,9 @@ impl Vault {
             slot.1.push(entry.path());
         }
 
-        let mut groups: Vec<BackupGroup> = merged
+        // (identity, group) — identity is what decides whether two vault ids
+        // are really the same world; see `world_identity`.
+        let mut groups: Vec<(Option<(i64, String)>, BackupGroup)> = merged
             .into_iter()
             .map(|(key, (mut snapshots, dirs))| {
                 snapshots.sort_by(|a, b| b.stamp.cmp(&a.stamp));
@@ -643,16 +682,68 @@ impl Vault {
                         found
                     })
                     .unwrap_or_else(|| "Unknown world".to_owned());
-                BackupGroup { key, name, snapshots }
+                let identity = world_identity(&dirs, &snapshots);
+                (identity, BackupGroup { key, name, snapshots })
             })
             .collect();
 
         groups.sort_by(|a, b| {
-            let a_newest = a.snapshots.first().map(|s| s.stamp.as_str()).unwrap_or("");
-            let b_newest = b.snapshots.first().map(|s| s.stamp.as_str()).unwrap_or("");
-            b_newest.cmp(a_newest)
+            let newest = |g: &BackupGroup| {
+                g.snapshots.first().map(|s| s.stamp.clone()).unwrap_or_default()
+            };
+            newest(&b.1).cmp(&newest(&a.1))
         });
-        groups
+
+        // Fold together the groups holding the same world. One world can end up
+        // under several vault ids — every import and every Realm download mints
+        // a new one — which showed the same world as three separate sections.
+        // The newest group's key and name win, since that is the copy the
+        // player last saw.
+        //
+        // Lineage vetoes a merge: a world that has lived in its own
+        // `minecraftWorlds` folder is a world the game itself keeps separate,
+        // so two groups with folders that do not overlap stay apart however
+        // alike they look. That is what tells two worlds made from the same
+        // marketplace map — same seed, same name — from two copies of one.
+        let folders: std::collections::HashMap<&str, std::collections::HashSet<&str>> = library
+            .iter()
+            .map(|e| {
+                let mut set: std::collections::HashSet<&str> =
+                    e.past_folders.iter().map(String::as_str).collect();
+                set.extend(e.origin_folder.as_deref());
+                (e.id.as_str(), set)
+            })
+            .collect();
+
+        let mut out: Vec<BackupGroup> = Vec::with_capacity(groups.len());
+        let mut seen: Vec<((i64, String), std::collections::HashSet<&str>, usize)> = Vec::new();
+        for (identity, group) in groups {
+            let lineage = folders.get(group.key.as_str()).cloned().unwrap_or_default();
+            let existing = identity.as_ref().and_then(|id| {
+                seen.iter().position(|(seen_id, seen_folders, _)| {
+                    seen_id == id
+                        && (lineage.is_empty()
+                            || seen_folders.is_empty()
+                            || !seen_folders.is_disjoint(&lineage))
+                })
+            });
+            match existing {
+                Some(slot) => {
+                    let (_, seen_folders, at) = &mut seen[slot];
+                    seen_folders.extend(lineage);
+                    let into: &mut BackupGroup = &mut out[*at];
+                    into.snapshots.extend(group.snapshots);
+                    into.snapshots.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+                }
+                None => {
+                    if let Some(id) = identity {
+                        seen.push((id, lineage, out.len()));
+                    }
+                    out.push(group);
+                }
+            }
+        }
+        out
     }
 
     /// Snapshot history for an entry, newest first.
@@ -1199,6 +1290,35 @@ mod tests {
         // Two, not three: archiving re-saved a world that had not changed, and
         // the copy of it already in history is the same bytes.
         assert_eq!(vault.snapshots(&archived).len(), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The reported case: the same world copied in twice showed up as two
+    /// sections, because every import mints a fresh vault id.
+    #[test]
+    fn copies_of_one_world_share_a_backup_section() {
+        let base = temp("mergecopies");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let mcworld = base.join("shared.mcworld");
+        mcworld::pack(&live, &mcworld).unwrap();
+        let first = vault.import_mcworld(&mcworld, "20260811-100000").unwrap();
+        vault.snapshot(&first.id, &first.world_dir, "20260811-100100").unwrap();
+        let second = vault.import_mcworld(&mcworld, "20260811-120000").unwrap();
+        vault.snapshot(&second.id, &second.world_dir, "20260811-120100").unwrap();
+        assert_ne!(first.id, second.id, "each import is its own vault entry");
+
+        let groups = vault.all_backups(&vault.list().unwrap());
+        assert_eq!(groups.len(), 1, "one world, one section: {groups:#?}");
+        assert_eq!(groups[0].snapshots.len(), 2, "both copies' history is there");
+        assert_eq!(groups[0].key, second.id, "the newest copy names the section");
+
+        // The seed is cached beside the snapshots so this costs no archive
+        // reads next time.
+        assert!(vault.backups_dir().join(&first.id).join("seed.txt").is_file());
 
         let _ = fs::remove_dir_all(&base);
     }
