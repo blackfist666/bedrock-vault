@@ -7,6 +7,7 @@
 - **Refresh** on the Realms page re-reads every Realm, so a world loaded or created from inside Minecraft shows up without restarting the app (#1)
 - Copying a Realm slot's world no longer promises the wrong world. Minecraft serves its own last backup of a slot, which can predate the world now on it; a slot in that state now says so and offers **Copy older world**, and a download that turns out to be a different world says which one arrived (#5)
 - Fixed a crash on the Realms page when anything redrew while a Realm's slots were still loading — typing in the search box, the Minecraft-running check, or Refresh (#5)
+- Backups are no longer taken of a world that has not changed since its last copy. Saving or backing up an untouched world stored another full archive every time — one world here held three identical 15 MB copies. **Back up** now says so instead of quietly making a duplicate (#6)
 - Realm slots now show a picture where there is a real one to show: the world's own `world_icon.jpeg` from a copy of it on this PC, matched by seed, or the artwork of the marketplace template it was built from. A slot with neither shows no picture rather than an invented one (#4)
 - Vault worlds now say where they last were: **MC**, **REALM**, **FILE** or **BACKUP**. The tag follows the world, so sending one up to a Realm makes it REALM and saving it out of the game makes it MC again. Worlds already in the vault stay untagged until they are next moved, since nothing recorded where they had been (#5)
 
