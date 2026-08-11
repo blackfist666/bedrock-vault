@@ -859,17 +859,17 @@ fn name_slot_packs(
     by_seed: &HashMap<String, Vec<PathBuf>>,
     marketplace: &[(String, String)],
 ) -> Vec<PackRefDto> {
-    let from_world: Vec<String> = local_copies(slot, by_seed)
+    // The uuid is kept alongside the name: a world's history records the real
+    // marketplace id, which is what carries the artwork if that pack is
+    // installed here — most of them are, bundled inside their world template.
+    let from_world: Vec<(String, String)> = local_copies(slot, by_seed)
         .iter()
         .map(|dir| {
-            let mut names: Vec<String> = packs::names_from_history(dir)
-                .into_iter()
-                .map(|(_, name)| name)
-                .collect();
-            names.dedup();
-            names
+            let mut packs = packs::names_from_history(dir);
+            packs.dedup();
+            packs
         })
-        .find(|names: &Vec<String>| !names.is_empty())
+        .find(|packs: &Vec<(String, String)>| !packs.is_empty())
         .unwrap_or_default();
 
     // uuids are written with and without dashes and in either case; compare on
@@ -893,7 +893,15 @@ fn name_slot_packs(
                 return PackRefDto { name: p.0.clone(), icon: p.1.clone(), installed: true };
             }
             match from_world.get(i).or_else(|| from_world.first()) {
-                Some(name) => PackRefDto { name: name.clone(), icon: None, installed: true },
+                // The world's own record of the pack. Its name is the one the
+                // player already knows it by, so that is kept even when the
+                // pack is installed here — but the artwork comes from the
+                // installed copy, which is the only place it exists.
+                Some((uuid, name)) => PackRefDto {
+                    name: name.clone(),
+                    icon: installed(uuid).and_then(|p| p.1.clone()),
+                    installed: true,
+                },
                 None => PackRefDto { name: "Add-on".to_owned(), icon: None, installed: false },
             }
         })
