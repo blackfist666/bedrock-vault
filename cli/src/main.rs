@@ -604,14 +604,25 @@ fn cmd_realm_download(
     })?;
     println!("Downloaded {}.", human_size(written));
 
-    let entry = vault.import_mcworld(&temp, &stamp())?;
+    let absorbed = vault.absorb_mcworld(&temp, &stamp(), Some((realm_id, slot)))?;
     std::fs::remove_file(&temp).ok();
-    println!(
-        "Added \"{}\" to the vault as {} ({}).",
-        entry.name,
-        entry.id,
-        human_size(entry.size_bytes)
-    );
+    let entry = absorbed.entry();
+    match absorbed {
+        bedrock_vault_core::vault::Absorbed::AlreadyHeld(_) => println!(
+            "\"{}\" is already in the vault as {}; nothing added.",
+            entry.name, entry.id
+        ),
+        bedrock_vault_core::vault::Absorbed::Updated(_) => println!(
+            "Updated \"{}\" ({}) — the copy it held was kept as a backup.",
+            entry.name, entry.id
+        ),
+        bedrock_vault_core::vault::Absorbed::Added(_) => println!(
+            "Added \"{}\" to the vault as {} ({}).",
+            entry.name,
+            entry.id,
+            human_size(entry.size_bytes)
+        ),
+    }
     Ok(())
 }
 

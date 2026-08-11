@@ -847,13 +847,18 @@ pub fn replace_slot_world(
             .join(format!("realm-{realm_id}-slot{slot}-before-{stamp}.mcworld"));
         fetch_world(&backup, &temp_backup, on_progress)
             .context("downloading the Realm's current world")?;
-        let entry = vault
-            .import_mcworld(&temp_backup, stamp)
+        // Through `absorb_mcworld`, because this runs on every replacement and
+        // the service often hands back a world the vault already has — the
+        // stored copy of a slot only changes when somebody plays there.
+        // Importing it each time left five copies of one world.
+        let absorbed = vault
+            .absorb_mcworld(&temp_backup, stamp, Some((realm_id, slot)))
             .context("saving the Realm's current world into the vault")?;
         std::fs::remove_file(&temp_backup).ok();
+        let id = absorbed.entry().id.clone();
         // It arrived as a file, but it came off a Realm; say so on the row.
-        vault.set_source(&entry.id, crate::vault::SOURCE_REALM)?;
-        Some(vault.entry(&entry.id).unwrap_or(entry))
+        vault.set_source(&id, crate::vault::SOURCE_REALM)?;
+        Some(vault.entry(&id)?)
     } else {
         // Only for a slot that holds nothing: there is no world to lose.
         None
