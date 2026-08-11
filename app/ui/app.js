@@ -28,7 +28,7 @@ const TOUCHES = {
 
 const EXPLAIN = {
   live: "These are the worlds Minecraft can see right now. Put one away to tidy up the in-game list — it stays safe in the vault.",
-  vault: "Every world you own lives here. Press Play to put one into Minecraft. Nothing here is lost when you tidy up your game.",
+  vault: "Every world you own lives here. Press Send to Minecraft to put one into the game. Nothing here is lost when you tidy up your game.",
   backups: "Older copies of your worlds, kept automatically. If a world goes wrong, restore a copy from before it happened.",
   packs: "Everything from the Marketplace that is installed on this PC, and which of your worlds uses it.",
   realms: "Your Realm and what is on it. Copy a Realm's world into your vault at any time.",
@@ -204,7 +204,7 @@ function liveRows() {
       help: "Save it to the vault and take it out of Minecraft's world list.",
       onClick: () => confirmRun(
         `Put "${w.name}" away?`,
-        "It goes into the vault and disappears from Minecraft's world list. Press Play in the Vault to bring it back whenever you like.",
+        "It goes into the vault and disappears from Minecraft's world list. Press Send to Minecraft in the Vault to bring it back whenever you like.",
         "Yes, put it away", "put_away", { folder: w.folder }),
     }));
 
@@ -229,7 +229,7 @@ function vaultRows() {
   return state.data.vault.filter((w) => matches(w.name)).map((w) => {
     const actions = [];
     if (!w.in_game) {
-      actions.push(button("Play here", {
+      actions.push(button("Send to Minecraft", {
         className: TOUCHES.minecraft, disabled: blocked, disabledReason: reason,
         help: "Copy this world into Minecraft on this PC, so it appears in your single-player world list.",
         onClick: () => run("play", { id: w.id }),
@@ -768,7 +768,7 @@ function render() {
   }[state.section]();
   if (!rows.length) {
     const empty = {
-      live: "No worlds in Minecraft right now. Press Play on a vault world to add one.",
+      live: "No worlds in Minecraft right now. Press Send to Minecraft on a vault world to add one.",
       vault: "The vault is empty. Save a world from Minecraft, or import a .mcworld file.",
       backups: "No backups yet. They are made automatically whenever a world is saved.",
       packs: "No marketplace content is installed on this PC.",

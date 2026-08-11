@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The vault's **Play here** button is now **Send to Minecraft**, so it reads the same way as **Send to Realm** (#2)
+
 ## v0.1.0 — 2026-08-10
 
 First release. A local world library for Minecraft Bedrock, with Realm support.
