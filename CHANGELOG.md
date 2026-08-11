@@ -3,6 +3,7 @@
 ## Unreleased
 
 - The vault's **Play here** button is now **Send to Minecraft**, so it reads the same way as **Send to Realm** (#2)
+- **Delete** on any backup in the Backups tab throws that one copy away; the world and the other copies are left alone (#3)
 
 ## v0.1.0 — 2026-08-10
 
