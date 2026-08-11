@@ -539,6 +539,77 @@ pub fn slot_is_downloadable(session: &auth::XstsToken, realm_id: i64, slot: i64)
     slot_download(session, realm_id, slot, None).is_ok()
 }
 
+/// What Minecraft actually has stored for a slot.
+///
+/// The download serves the service's own last backup of that slot, and putting
+/// a different world on the slot does **not** make it take a fresh one — the
+/// stored copy stays as it was until somebody plays there. So a slot can offer
+/// a download that is a *previous occupant* of the slot rather than the world
+/// shown on it, with nothing in `/worlds/{id}` to say so.
+///
+/// The download token names the packs of the copy it authorises, which is
+/// enough to tell the two apart before spending a download finding out.
+#[derive(Debug, Clone)]
+pub struct StoredWorld {
+    pub size_bytes: u64,
+    /// Pack refs the stored copy carries, sorted. Empty when the token said
+    /// nothing — a world with no add-ons, or a token we could not read.
+    pub pack_ids: Vec<String>,
+}
+
+impl StoredWorld {
+    /// Whether this stored copy looks like the world now on the slot.
+    ///
+    /// `None` when there is nothing to compare: either side having no packs
+    /// leaves the question open, and a guess would be worse than silence.
+    pub fn matches_slot(&self, slot: &Slot) -> Option<bool> {
+        if self.pack_ids.is_empty() || slot.pack_ids.is_empty() {
+            return None;
+        }
+        Some(self.pack_ids == slot.pack_ids)
+    }
+}
+
+/// Ask what the service holds for a slot, without downloading it.
+pub fn stored_world(session: &auth::XstsToken, realm_id: i64, slot: i64) -> Option<StoredWorld> {
+    let download = slot_download(session, realm_id, slot, None).ok()?;
+    Some(StoredWorld {
+        size_bytes: download.size_bytes,
+        pack_ids: token_pack_ids(&download.token),
+    })
+}
+
+/// Pack refs listed inside a download token.
+///
+/// The token is a JWT; its middle segment is the claim set, which carries the
+/// pack list of the archive it authorises. Nothing is verified — we are reading
+/// a description of a file we are about to fetch anyway, not trusting an
+/// assertion — and anything unreadable comes back empty so the caller simply
+/// learns nothing rather than being told something wrong.
+fn token_pack_ids(token: &str) -> Vec<String> {
+    use base64::Engine;
+
+    let Some(payload) = token.split('.').nth(1) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return Vec::new();
+    };
+    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+
+    let mut ids: Vec<String> = ["resourcePacks", "behaviorPacks"]
+        .iter()
+        .filter_map(|key| claims[*key].as_array())
+        .flatten()
+        .filter_map(|p| p["ref"].as_str().map(str::to_owned))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Stream a slot's world to disk as a `.mcworld`.
 ///
 /// The content host is separate from the Realms API and takes the signed token
@@ -1123,5 +1194,70 @@ mod tests {
         assert_eq!(realm.name, "<unnamed>");
         assert_eq!(realm.state, "UNKNOWN");
         assert_eq!(realm.owner, None);
+    }
+
+    fn fake_token(claims: serde_json::Value) -> String {
+        use base64::Engine;
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        format!("header.{payload}.signature")
+    }
+
+    fn slot_with_packs(packs: &[&str]) -> Slot {
+        let mut pack_ids: Vec<String> = packs.iter().map(|p| (*p).to_owned()).collect();
+        pack_ids.sort();
+        Slot {
+            slot_id: 1,
+            name: Some("DRAGONS++".into()),
+            game_mode: None,
+            difficulty: None,
+            hardcore: false,
+            seed: None,
+            pack_ids,
+            rules: Vec::new(),
+            active: false,
+            empty: false,
+        }
+    }
+
+    /// The case from issue #5: the slot shows one world, the service still
+    /// holds the previous occupant, and only the token's pack list says so.
+    #[test]
+    fn a_stale_stored_copy_is_told_apart_by_its_packs() {
+        let stored = StoredWorld {
+            size_bytes: 1_908_503,
+            pack_ids: token_pack_ids(&fake_token(serde_json::json!({
+                "behaviorPacks": [{ "ref": "c5890e78560f4a4c88567abedf8020ef" }],
+                "resourcePacks": [{ "ref": "f29b7376af8646d5a12cb58140ceec6f" }],
+            }))),
+        };
+        assert_eq!(stored.pack_ids.len(), 2);
+
+        let on_the_slot = slot_with_packs(&[
+            "97a3a3d857ba493dbb5cf1cb6931feb5",
+            "b95f1b02955f4f9db9a3270cc5315f32",
+        ]);
+        assert_eq!(stored.matches_slot(&on_the_slot), Some(false));
+
+        let same_world = slot_with_packs(&[
+            "c5890e78560f4a4c88567abedf8020ef",
+            "f29b7376af8646d5a12cb58140ceec6f",
+        ]);
+        assert_eq!(stored.matches_slot(&same_world), Some(true));
+    }
+
+    /// Silence beats a guess: with no packs on either side there is nothing to
+    /// compare, and an unreadable token must not read as "different world".
+    #[test]
+    fn nothing_to_compare_answers_unknown() {
+        let empty = StoredWorld { size_bytes: 0, pack_ids: Vec::new() };
+        assert_eq!(empty.matches_slot(&slot_with_packs(&["a"])), None);
+
+        let stored = StoredWorld { size_bytes: 0, pack_ids: vec!["a".into()] };
+        assert_eq!(stored.matches_slot(&slot_with_packs(&[])), None);
+
+        for rubbish in ["", "not.a.token", "a.!!!not-base64!!!.c", "a.e30.c"] {
+            assert!(token_pack_ids(rubbish).is_empty(), "{rubbish}");
+        }
     }
 }

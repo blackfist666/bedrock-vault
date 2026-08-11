@@ -353,8 +353,12 @@ function realmHero(realm) {
   head.append(actions);
   card.append(head);
 
+  // `loading` matters as much as `undefined`: the slots take a second or two
+  // to arrive, and anything that redraws in the meantime — typing in the
+  // search box, the game-running poll, Refresh — would otherwise read the
+  // placeholder as a loaded Realm and throw on its missing slot list.
   const detail = state.realmDetail[realm.id];
-  if (!detail) {
+  if (!detail || detail.loading) {
     card.append(el("div", "hero-loading", "Loading worlds…"));
     loadRealmDetail(realm.id);
     return card;
@@ -421,6 +425,12 @@ function realmHero(realm) {
     if (!slot.can_backup) {
       s.append(el("div", "slot-warn",
         "Minecraft has no saved copy of this world yet, so it cannot be copied to your vault."));
+    } else if (slot.stored_is_older_world) {
+      // Minecraft only saves a slot again once somebody plays there, so the
+      // copy it holds can still be the world that was here before.
+      s.append(el("div", "slot-warn",
+        `Minecraft's saved copy of this slot is an older world, not "${slot.name}". ` +
+        "Copying it would bring that older world into your vault."));
     }
 
     if (realm.can_download) {
@@ -450,12 +460,20 @@ function realmHero(realm) {
           (name) => run("realm_rename_slot", { realmId: realm.id, slot: slot.slot_id, name })),
       }));
       if (slot.can_backup) {
-        slotActions.append(button("Copy to vault", {
+        const older = slot.stored_is_older_world;
+        slotActions.append(button(older ? "Copy older world" : "Copy to vault", {
           className: TOUCHES.vault,
-          help: "Download this slot's world into your vault. Nothing on the Realm changes.",
+          help: older
+            ? "Download the older world Minecraft still has saved for this slot."
+            : "Download this slot's world into your vault. Nothing on the Realm changes.",
           onClick: () => confirmRun(
-            `Copy "${slot.name}" into your vault?`,
-            "The world is downloaded and added to your vault. Nothing on the Realm is changed.",
+            older
+              ? `Copy the older world saved for slot ${slot.slot_id}?`
+              : `Copy "${slot.name}" into your vault?`,
+            older
+              ? `Minecraft's saved copy of this slot is not "${slot.name}" — it is a world that ` +
+                "was here before. That older world is what lands in your vault. Nothing on the Realm is changed."
+              : "The world is downloaded and added to your vault. Nothing on the Realm is changed.",
             "Yes, copy it", "realm_download",
             { realmId: realm.id, slot: slot.slot_id, name: slot.name }),
         }));

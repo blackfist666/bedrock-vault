@@ -5,6 +5,8 @@
 - The vault's **Play here** button is now **Send to Minecraft**, so it reads the same way as **Send to Realm** (#2)
 - **Delete** on any backup in the Backups tab throws that one copy away; the world and the other copies are left alone (#3)
 - **Refresh** on the Realms page re-reads every Realm, so a world loaded or created from inside Minecraft shows up without restarting the app (#1)
+- Copying a Realm slot's world no longer promises the wrong world. Minecraft serves its own last backup of a slot, which can predate the world now on it; a slot in that state now says so and offers **Copy older world**, and a download that turns out to be a different world says which one arrived (#5)
+- Fixed a crash on the Realms page when anything redrew while a Realm's slots were still loading — typing in the search box, the Minecraft-running check, or Refresh (#5)
 
 ## v0.1.0 — 2026-08-10
 

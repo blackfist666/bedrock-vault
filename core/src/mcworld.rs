@@ -101,6 +101,20 @@ pub fn name_in_archive(mcworld: &Path) -> Option<String> {
     crate::level_dat::parse(&bytes).ok()?.name.filter(|n| !n.is_empty())
 }
 
+/// Read a world's seed out of a `.mcworld` without unpacking it.
+///
+/// The seed is the one thing about a world nobody can rename, so it is how a
+/// downloaded archive is checked against the Realm slot it was supposed to
+/// come from.
+pub fn seed_in_archive(mcworld: &Path) -> Option<i64> {
+    let file = File::open(mcworld).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut entry = zip.by_name("level.dat").ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut bytes).ok()?;
+    crate::level_dat::parse(&bytes).ok()?.seed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +145,11 @@ mod tests {
         }
         let meta = level_dat::parse(&fs::read(restored.join("level.dat")).unwrap()).unwrap();
         assert_eq!(meta.name.as_deref(), Some("Spike Test World"));
+
+        // Read straight out of the archive: this is how a Realm download is
+        // checked against the slot it was supposed to come from.
+        assert_eq!(seed_in_archive(&mcworld), Some(-4406166776699799973));
+        assert_eq!(seed_in_archive(&base.join("nope.mcworld")), None);
 
         let _ = fs::remove_dir_all(&base);
     }
