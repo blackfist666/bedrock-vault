@@ -527,6 +527,10 @@ struct SlotDto {
     /// Whether Minecraft will hand this slot's world over, which is what makes
     /// a backup-before-replacing possible.
     can_backup: bool,
+    /// True when the copy Minecraft holds for this slot is a *different* world
+    /// from the one on it now — a previous occupant, never re-backed up after
+    /// the swap. `null` when nothing available says either way.
+    stored_is_older_world: Option<bool>,
     /// Pack names where installed locally, otherwise a short id.
     packs: Vec<PackRefDto>,
     rules: Vec<[String; 2]>,
@@ -679,18 +683,31 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
         let slots: Vec<SlotDto> = detail
             .slots
             .into_iter()
-            .map(|s| SlotDto {
-                name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
-                packs: name_slot_packs(&s, &known, &by_seed),
-                rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
-                slot_id: s.slot_id,
-                game_mode: s.game_mode,
-                difficulty: s.difficulty,
-                hardcore: s.hardcore,
-                seed: s.seed,
-                active: s.active,
-                can_backup: !s.empty && realms::slot_is_downloadable(&session, realm_id, s.slot_id),
-                empty: s.empty,
+            .map(|s| {
+                // One request answers both questions: whether a copy exists at
+                // all, and whether it is this world or a previous occupant.
+                let stored = if s.empty {
+                    None
+                } else {
+                    realms::stored_world(&session, realm_id, s.slot_id)
+                };
+                SlotDto {
+                    name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
+                    packs: name_slot_packs(&s, &known, &by_seed),
+                    rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
+                    can_backup: stored.is_some(),
+                    stored_is_older_world: stored
+                        .as_ref()
+                        .and_then(|st| st.matches_slot(&s))
+                        .map(|same| !same),
+                    slot_id: s.slot_id,
+                    game_mode: s.game_mode,
+                    difficulty: s.difficulty,
+                    hardcore: s.hardcore,
+                    seed: s.seed,
+                    active: s.active,
+                    empty: s.empty,
+                }
             })
             .collect();
 
@@ -974,6 +991,13 @@ async fn realm_download(
                 .ok_or("could not tell which slot to download")?,
         };
 
+        // What the slot says it is holding, to check the archive against once
+        // it lands. Only the seed is worth trusting: a name can be anything.
+        let expected = realms::detail(&session, realm_id)
+            .ok()
+            .and_then(|d| d.slots.into_iter().find(|s| s.slot_id == slot))
+            .map(|s| (s.name, s.seed));
+
         let download = realms::slot_download(&session, realm_id, slot, None)
             .map_err(|e| format!("{e:#}"))?;
 
@@ -997,10 +1021,31 @@ async fn realm_download(
         })
         .map_err(|e| format!("{e:#}"))?;
 
+        // Minecraft serves its own last backup of the slot, which can predate
+        // the world now on it, so say plainly when a different world arrived
+        // rather than banking it under the name that was clicked.
+        let arrived_seed = bedrock_vault_core::mcworld::seed_in_archive(&temp);
+        let wrong_world = match (&expected, arrived_seed) {
+            (Some((_, Some(want))), Some(got)) => want.parse::<i64>().ok() != Some(got),
+            _ => false,
+        };
+
         let entry = vault
             .import_mcworld(&temp, &stamp())
             .map_err(|e| format!("{e:#}"))?;
         std::fs::remove_file(&temp).ok();
+
+        if wrong_world {
+            let on_the_slot = expected
+                .and_then(|(name, _)| name)
+                .unwrap_or_else(|| name.clone());
+            return Ok(format!(
+                "Minecraft's saved copy of slot {slot} is an older world — \"{}\", not \"{}\" — \
+                 so that is what came into your vault. Minecraft only saves a slot again once \
+                 somebody plays there.",
+                entry.name, on_the_slot
+            ));
+        }
         Ok(format!("\"{}\" is now in your vault", entry.name))
     })
     .await
