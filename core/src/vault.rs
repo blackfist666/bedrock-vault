@@ -122,6 +122,53 @@ struct Meta {
     /// scatter into a fresh group each time it moved.
     #[serde(default)]
     past_folders: Vec<String>,
+    /// [`fingerprint`] of the world when the last snapshot was taken, so an
+    /// unchanged world is not stored again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_fingerprint: Option<String>,
+}
+
+/// A content fingerprint of a world folder: every file's path and bytes.
+///
+/// Deliberately not a cheap proxy. Sizes and timestamps both miss real edits —
+/// a chunk rewritten to the same length, a `level.dat` untouched while the
+/// database moved — and the cost of missing one is a lost backup, so this reads
+/// the world rather than guessing about it. Reading is still an order of
+/// magnitude cheaper than the packing it saves, which is the whole point.
+///
+/// Empty when anything cannot be read, which callers must treat as "cannot
+/// tell" and never as "unchanged".
+fn fingerprint(world_dir: &Path) -> String {
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        // FNV-1a: a few lines, no dependency, and this only has to notice a
+        // difference — nothing here is defending against a forged world.
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+
+    if !world_dir.join("level.dat").is_file() {
+        return String::new();
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    // Sorted, so the same world always hashes the same way whatever order the
+    // filesystem hands the entries back in.
+    for entry in walkdir::WalkDir::new(world_dir).sort_by_file_name() {
+        let Ok(entry) = entry else { return String::new() };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(world_dir) else { return String::new() };
+        let Ok(content) = fs::read(entry.path()) else { return String::new() };
+        feed(&mut hash, rel.to_string_lossy().replace('\\', "/").as_bytes());
+        feed(&mut hash, &content);
+        files += 1;
+        bytes += content.len() as u64;
+    }
+    format!("{files}-{bytes}-{hash:016x}")
 }
 
 pub struct Vault {
@@ -472,6 +519,7 @@ impl Vault {
             synced_at: Some(now()),
             size_bytes: Some(scan::dir_size(&entry.world_dir)),
             past_folders: Vec::new(),
+            snapshot_fingerprint: None,
         };
         self.write_meta(id, &meta)?;
         self.entry(id)
@@ -497,10 +545,26 @@ impl Vault {
     }
 
     /// Take a snapshot and prune old ones per the retention setting.
-    pub fn snapshot(&self, id: &str, world_dir: &Path, stamp: &str) -> Result<PathBuf> {
+    ///
+    /// `None` when the world is unchanged since the last snapshot: a second
+    /// copy of identical bytes is not history, it is just disk. One world here
+    /// held three 15 MB archives of the same unplayed world.
+    pub fn snapshot(&self, id: &str, world_dir: &Path, stamp: &str) -> Result<Option<PathBuf>> {
+        let now = fingerprint(world_dir);
+        if let Some(last) = self.read_meta(id).snapshot_fingerprint {
+            // Only skip on a positive match. An unreadable world fingerprints
+            // as nothing, and "cannot tell" must always mean "take the copy".
+            if !now.is_empty() && last == now && !self.snapshots_for_key(id).is_empty() {
+                return Ok(None);
+            }
+        }
+
         let path = self.snapshot_named(id, world_dir, stamp)?;
+        let mut meta = self.read_meta(id);
+        meta.snapshot_fingerprint = Some(now);
+        self.write_meta(id, &meta)?;
         self.prune_snapshots(id)?;
-        Ok(path)
+        Ok(Some(path))
     }
 
     fn snapshot_named(&self, id: &str, world_dir: &Path, stamp: &str) -> Result<PathBuf> {
@@ -869,9 +933,18 @@ mod tests {
             b"MANIFEST-000002\n",
             "vault copy should hold the newer data"
         );
-        assert!(
-            vault.snapshots(&second).len() >= 2,
-            "history keeps the pre-sync snapshot"
+        // The pre-sync state is in history — held by the snapshot the first
+        // save took, since the vault copy did not change in between. Checked by
+        // reading it back rather than by counting files, because a second copy
+        // of those same bytes would be storage, not history.
+        let snapshots = vault.snapshots(&second);
+        assert_eq!(snapshots.len(), 1, "no duplicate of an unchanged copy");
+        let restored = base.join("readback");
+        mcworld::unpack(&snapshots[0].path, &restored).unwrap();
+        assert_eq!(
+            fs::read(restored.join("db").join("CURRENT")).unwrap(),
+            b"MANIFEST-000001\n",
+            "history keeps the pre-sync world"
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -971,6 +1044,7 @@ mod tests {
         make_world(&live, "Spike Test World");
         let vault = Vault::open(base.join("vault")).unwrap();
         let entry = vault.protect(&live, "abc=", "20260811-100000").unwrap();
+        fs::write(entry.world_dir.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
         vault.snapshot(&entry.id, &entry.world_dir, "20260811-110000").unwrap();
 
         let snaps = vault.snapshots_for_key(&entry.id);
@@ -993,6 +1067,45 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// The reported case: three 15 MB archives of the same unplayed world.
+    #[test]
+    fn an_unchanged_world_is_not_stored_again() {
+        let base = temp("nodupe");
+        let live = base.join("minecraftWorlds").join("abc=");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let entry = vault.protect(&live, "abc=", "20260811-100000").unwrap();
+        assert_eq!(vault.snapshots_for_key(&entry.id).len(), 1);
+
+        // Saving and backing up again, with nothing touched in between.
+        assert!(vault.snapshot(&entry.id, &entry.world_dir, "20260811-110000").unwrap().is_none());
+        vault.protect(&live, "abc=", "20260811-120000").unwrap();
+        assert_eq!(
+            vault.snapshots_for_key(&entry.id).len(),
+            1,
+            "the same bytes must not be stored twice"
+        );
+
+        // Play it, and the copy is worth keeping again. Only `level.dat`
+        // changes here, and every file keeps its length — the case a
+        // size-and-count fingerprint would miss.
+        let played = level_dat::test_fixtures::synthetic_level_dat_with_last_played(1754999999);
+        assert_eq!(
+            played.len(),
+            fs::read(entry.world_dir.join("level.dat")).unwrap().len(),
+            "the fixture must differ in content but not in size"
+        );
+        fs::write(entry.world_dir.join("level.dat"), &played).unwrap();
+        assert!(vault.snapshot(&entry.id, &entry.world_dir, "20260811-130000").unwrap().is_some());
+        assert_eq!(vault.snapshots_for_key(&entry.id).len(), 2);
+
+        // A world whose folder cannot be read must never read as "unchanged".
+        assert!(fingerprint(&base.join("nowhere")).is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn retention_prunes_old_snapshots_but_keeps_deletions() {
         let base = temp("retention");
@@ -1002,12 +1115,20 @@ mod tests {
         vault.settings.snapshot_retention = 2;
 
         let entry = vault.protect(&live, "abc=", "20260810-100000").unwrap();
-        for stamp in ["20260810-110000", "20260810-120000", "20260810-130000"] {
+        // The world has to actually change between saves, or the vault rightly
+        // refuses to store the same bytes again and there is nothing to prune.
+        for (n, stamp) in ["20260810-110000", "20260810-120000", "20260810-130000"]
+            .iter()
+            .enumerate()
+        {
+            fs::write(entry.world_dir.join("db").join("CURRENT"), format!("MANIFEST-{n}\n"))
+                .unwrap();
             vault.snapshot(&entry.id, &entry.world_dir, stamp).unwrap();
         }
         assert_eq!(vault.snapshots_for_key(&entry.id).len(), 2);
 
         vault.snapshot_named(&entry.id, &entry.world_dir, "20260810-140000-deleted").unwrap();
+        fs::write(entry.world_dir.join("db").join("CURRENT"), b"MANIFEST-later\n").unwrap();
         vault.snapshot(&entry.id, &entry.world_dir, "20260810-150000").unwrap();
         let stamps: Vec<_> = vault.snapshots_for_key(&entry.id).into_iter().map(|s| s.stamp).collect();
         assert!(
@@ -1075,7 +1196,9 @@ mod tests {
         let archived = vault.archive(&live, "9Ysgap55yI8=", "20260810-110000").unwrap();
         let after = vault.all_backups(&vault.list().unwrap());
         assert_eq!(after.len(), 1, "archiving must not split the history: {after:#?}");
-        assert_eq!(vault.snapshots(&archived).len(), 3);
+        // Two, not three: archiving re-saved a world that had not changed, and
+        // the copy of it already in history is the same bytes.
+        assert_eq!(vault.snapshots(&archived).len(), 2);
 
         let _ = fs::remove_dir_all(&base);
     }

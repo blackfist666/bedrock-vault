@@ -422,10 +422,16 @@ async fn back_up(id: String) -> Result<String, String> {
     blocking(move || {
         let vault = open_vault()?;
         let entry = vault.entry(&id).map_err(|e| format!("{e:#}"))?;
-        vault
+        let taken = vault
             .snapshot(&id, &entry.world_dir, &stamp())
             .map_err(|e| format!("{e:#}"))?;
-        Ok(format!("Backed up \"{}\"", entry.name))
+        Ok(match taken {
+            Some(_) => format!("Backed up \"{}\"", entry.name),
+            None => format!(
+                "\"{}\" has not changed since the last backup, so there was no need to make another",
+                entry.name
+            ),
+        })
     })
     .await
 }
