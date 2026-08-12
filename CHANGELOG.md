@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A Realm of your own that is closed now says so in amber and offers **Open** right beside it. The app can strand a Realm itself — replacing a world closes it, uploads, then reopens, so anything that interrupts that leaves it shut — and until now the only way back in was to open it from inside Minecraft, which is the trip the app exists to save (#9)
 - The vault's **Play here** button is now **Send to Minecraft**, so it reads the same way as **Send to Realm** (#2)
 - **Delete** on any backup in the Backups tab throws that one copy away; the world and the other copies are left alone (#3)
 - **Refresh** on the Realms page re-reads every Realm, so a world loaded or created from inside Minecraft shows up without restarting the app (#1)

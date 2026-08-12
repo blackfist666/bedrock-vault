@@ -1262,6 +1262,28 @@ async fn realm_switch_slot(realm_id: i64, slot: i64) -> Result<String, String> {
     .await
 }
 
+/// Reopen a Realm that is closed, so people can join it again.
+///
+/// The app can strand a Realm itself: a swap goes close → upload → name →
+/// reopen, and anything that interrupts that — the app being closed mid-upload,
+/// a crash, a dropped connection — leaves it offline. Without this the only way
+/// back was to open it from inside Minecraft, which is the trip the app exists
+/// to save.
+#[tauri::command]
+async fn realm_open(realm_id: i64) -> Result<String, String> {
+    blocking(move || {
+        let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
+        let up = realms::open_and_wait(&session, realm_id).map_err(|e| format!("{e:#}"))?;
+        Ok(if up {
+            "The Realm is open — everyone can join it again".to_owned()
+        } else {
+            "Minecraft is starting the Realm up. It can take a minute — press Refresh to check."
+                .to_owned()
+        })
+    })
+    .await
+}
+
 /// Turn off every add-on on a Realm slot.
 #[tauri::command]
 async fn realm_clear_packs(realm_id: i64, slot: i64) -> Result<String, String> {
@@ -1476,7 +1498,7 @@ fn main() {
             restore, delete_backup, import, export, open_folder, set_vault_location, realms_overview,
             realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out,
             realm_download, realm_detail, realm_targets, realm_upload, realm_rename_slot,
-            realm_clear_packs, realm_switch_slot, packs_overview, profile, open_url
+            realm_clear_packs, realm_switch_slot, realm_open, packs_overview, profile, open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");

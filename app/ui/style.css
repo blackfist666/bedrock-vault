@@ -112,7 +112,9 @@ header {
 
 .hero-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .hero-title h2 { margin: 0 0 8px; font-size: 20px; }
-.hero-sub { display: flex; flex-wrap: wrap; gap: 6px; }
+.hero-sub { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+/* The Open button sits in the chip row, so it is sized to that row. */
+.hero-sub .mc-btn { padding: 4px 12px; font-size: 12px; border-bottom-width: 3px; }
 .hero-loading { color: var(--muted); font-size: 13px; }
 
 .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
