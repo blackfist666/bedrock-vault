@@ -732,6 +732,32 @@ pub fn open(session: &auth::XstsToken, realm_id: i64) -> Result<()> {
     request(session, "PUT", &format!("/worlds/{realm_id}/open")).map(|_| ())
 }
 
+/// Reopen a Realm and wait for the service to say it is back up.
+///
+/// Answers whether `OPEN` was actually seen. Starting a Realm server takes a
+/// moment, so `false` means "not yet", never "it failed" — the request was
+/// still accepted. As with closing, a 503 here is the service saying it is
+/// working on it.
+pub fn open_and_wait(session: &auth::XstsToken, realm_id: i64) -> Result<bool> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    const ATTEMPTS: u32 = 6;
+
+    if let Err(e) = open(session, realm_id) {
+        let message = format!("{e:#}");
+        if !message.contains("busy or unavailable") {
+            return Err(e);
+        }
+    }
+
+    for _ in 0..ATTEMPTS {
+        std::thread::sleep(POLL);
+        if state(session, realm_id)? == "OPEN" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Send a `.mcworld` to a Realm slot.
 ///
 /// As with downloads, the content host is separate from the API and takes the

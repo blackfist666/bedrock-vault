@@ -341,7 +341,19 @@ function realmHero(realm) {
   const title = el("div", "hero-title");
   title.append(el("h2", null, realm.name));
   const sub = el("div", "hero-sub");
-  sub.append(el("span", `chip ${realm.state === "OPEN" ? "mode" : ""}`, realm.state === "OPEN" ? "Open" : "Closed"));
+  // A Realm of your own that is closed is usually not deliberate — the app
+  // itself can leave one that way if a swap is interrupted — so it is called
+  // out in amber with the one button that fixes it, rather than sitting
+  // quietly in grey.
+  const isOpen = realm.state === "OPEN";
+  sub.append(el("span", `chip ${isOpen ? "mode" : "warn"}`, isOpen ? "Open" : "Closed"));
+  if (!isOpen && realm.can_download) {
+    sub.append(button("Open", {
+      className: TOUCHES.realm,
+      help: "Start the Realm again so everyone can join it.",
+      onClick: () => run("realm_open", { realmId: realm.id }),
+    }));
+  }
   sub.append(el("span", `chip ${realm.expired ? "warn" : "saved"}`, realm.subscription));
   sub.append(el("span", "chip", `Up to ${realm.max_players ?? "?"} players`));
   title.append(sub);
@@ -924,6 +936,7 @@ async function run(cmd, args) {
     realms_sign_out: "Signing out", realm_download: "Downloading from the Realm",
     realm_upload: "Sending to the Realm", realm_rename_slot: "Renaming",
     realm_clear_packs: "Updating the Realm", realm_switch_slot: "Switching world",
+    realm_open: "Opening the Realm",
   }[cmd] || "Working";
   showProgress(`${label}…`, 0, 0);
   try {
