@@ -223,6 +223,10 @@ pub struct Slot {
     pub active: bool,
     /// No world has ever been put here.
     pub empty: bool,
+    /// Artwork for the marketplace template this world was built from, if it
+    /// was. The only picture the service ever offers of a slot — an ordinary
+    /// world has none, and `thumbnailId` is null on every Realm.
+    pub template_image: Option<String>,
 }
 
 /// Every Bedrock Realm has three world slots, whether or not they hold a world.
@@ -273,6 +277,7 @@ pub fn detail(session: &auth::XstsToken, realm_id: i64) -> Result<RealmDetail> {
                     difficulty: None,
                     hardcore: false,
                     seed: None,
+                    template_image: None,
                     pack_ids: Vec::new(),
                     rules: Vec::new(),
                     active: Some(id) == active_slot,
@@ -371,6 +376,7 @@ fn slot_from(v: &serde_json::Value, active_slot: Option<i64>) -> Slot {
         hardcore: options["hardcore"].as_bool().unwrap_or(false)
             || settings.get("IsHardcore").and_then(|v| v.as_bool()).unwrap_or(false),
         seed: settings.get("RandomSeed").and_then(|v| v.as_i64()).map(|n| n.to_string()),
+        template_image: non_empty(options["worldTemplateImage"].as_str()),
         pack_ids,
         rules: dedupe_rules(rules),
         active: Some(slot_id) == active_slot,
@@ -539,6 +545,85 @@ pub fn slot_is_downloadable(session: &auth::XstsToken, realm_id: i64, slot: i64)
     slot_download(session, realm_id, slot, None).is_ok()
 }
 
+/// What Minecraft actually has stored for a slot.
+///
+/// The download serves the service's own last backup of that slot, and putting
+/// a different world on the slot does **not** make it take a fresh one — the
+/// stored copy stays as it was until somebody plays there. So a slot can offer
+/// a download that is a *previous occupant* of the slot rather than the world
+/// shown on it, with nothing in `/worlds/{id}` to say so.
+///
+/// The download token names the packs of the copy it authorises, which is
+/// enough to tell the two apart before spending a download finding out.
+#[derive(Debug, Clone)]
+pub struct StoredWorld {
+    pub size_bytes: u64,
+    /// Pack refs the stored copy carries, sorted. Empty when the token said
+    /// nothing — a world with no add-ons, or a token we could not read.
+    pub pack_ids: Vec<String>,
+    /// Each pack's Realms-minted ref paired with its real marketplace id.
+    ///
+    /// The ref is the only id a slot reports and it exists nowhere outside
+    /// Realms, which is why a slot's add-ons could not be named. The token
+    /// carries both, and the marketplace id is exactly what this PC's own
+    /// installed content is keyed by.
+    pub marketplace_ids: Vec<(String, String)>,
+}
+
+impl StoredWorld {
+    /// Whether this stored copy looks like the world now on the slot.
+    ///
+    /// `None` when there is nothing to compare: either side having no packs
+    /// leaves the question open, and a guess would be worse than silence.
+    pub fn matches_slot(&self, slot: &Slot) -> Option<bool> {
+        if self.pack_ids.is_empty() || slot.pack_ids.is_empty() {
+            return None;
+        }
+        Some(self.pack_ids == slot.pack_ids)
+    }
+}
+
+/// Ask what the service holds for a slot, without downloading it.
+pub fn stored_world(session: &auth::XstsToken, realm_id: i64, slot: i64) -> Option<StoredWorld> {
+    let download = slot_download(session, realm_id, slot, None).ok()?;
+    let marketplace_ids = token_packs(&download.token);
+    let mut pack_ids: Vec<String> = marketplace_ids.iter().map(|(r, _)| r.clone()).collect();
+    pack_ids.sort();
+    pack_ids.dedup();
+    Some(StoredWorld { size_bytes: download.size_bytes, pack_ids, marketplace_ids })
+}
+
+/// Each pack listed inside a download token, as `(ref, marketplace id)`.
+///
+/// The token is a JWT; its middle segment is the claim set, which carries the
+/// pack list of the archive it authorises — each one with both the Realms-minted
+/// `ref` a slot reports and the `packId` the marketplace uses. Nothing is
+/// verified: we are reading a description of a file we are about to fetch
+/// anyway, not trusting an assertion. Anything unreadable comes back empty so
+/// the caller simply learns nothing rather than being told something wrong.
+fn token_packs(token: &str) -> Vec<(String, String)> {
+    use base64::Engine;
+
+    let Some(payload) = token.split('.').nth(1) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return Vec::new();
+    };
+    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+
+    ["resourcePacks", "behaviorPacks"]
+        .iter()
+        .filter_map(|key| claims[*key].as_array())
+        .flatten()
+        .filter_map(|p| {
+            Some((p["ref"].as_str()?.to_owned(), p["packId"].as_str()?.to_owned()))
+        })
+        .collect()
+}
+
 /// Stream a slot's world to disk as a `.mcworld`.
 ///
 /// The content host is separate from the Realms API and takes the signed token
@@ -645,6 +730,32 @@ pub fn close_and_wait(
 /// Reopen a Realm.
 pub fn open(session: &auth::XstsToken, realm_id: i64) -> Result<()> {
     request(session, "PUT", &format!("/worlds/{realm_id}/open")).map(|_| ())
+}
+
+/// Reopen a Realm and wait for the service to say it is back up.
+///
+/// Answers whether `OPEN` was actually seen. Starting a Realm server takes a
+/// moment, so `false` means "not yet", never "it failed" — the request was
+/// still accepted. As with closing, a 503 here is the service saying it is
+/// working on it.
+pub fn open_and_wait(session: &auth::XstsToken, realm_id: i64) -> Result<bool> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    const ATTEMPTS: u32 = 6;
+
+    if let Err(e) = open(session, realm_id) {
+        let message = format!("{e:#}");
+        if !message.contains("busy or unavailable") {
+            return Err(e);
+        }
+    }
+
+    for _ in 0..ATTEMPTS {
+        std::thread::sleep(POLL);
+        if state(session, realm_id)? == "OPEN" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Send a `.mcworld` to a Realm slot.
@@ -770,11 +881,18 @@ pub fn replace_slot_world(
             .join(format!("realm-{realm_id}-slot{slot}-before-{stamp}.mcworld"));
         fetch_world(&backup, &temp_backup, on_progress)
             .context("downloading the Realm's current world")?;
-        let entry = vault
-            .import_mcworld(&temp_backup, stamp)
+        // Through `absorb_mcworld`, because this runs on every replacement and
+        // the service often hands back a world the vault already has — the
+        // stored copy of a slot only changes when somebody plays there.
+        // Importing it each time left five copies of one world.
+        let absorbed = vault
+            .absorb_mcworld(&temp_backup, stamp, Some((realm_id, slot)))
             .context("saving the Realm's current world into the vault")?;
         std::fs::remove_file(&temp_backup).ok();
-        Some(entry)
+        let id = absorbed.entry().id.clone();
+        // It arrived as a file, but it came off a Realm; say so on the row.
+        vault.set_source(&id, crate::vault::SOURCE_REALM)?;
+        Some(vault.entry(&id)?)
     } else {
         // Only for a slot that holds nothing: there is no world to lose.
         None
@@ -1123,5 +1241,115 @@ mod tests {
         assert_eq!(realm.name, "<unnamed>");
         assert_eq!(realm.state, "UNKNOWN");
         assert_eq!(realm.owner, None);
+    }
+
+    fn fake_token(claims: serde_json::Value) -> String {
+        use base64::Engine;
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        format!("header.{payload}.signature")
+    }
+
+    fn slot_with_packs(packs: &[&str]) -> Slot {
+        let mut pack_ids: Vec<String> = packs.iter().map(|p| (*p).to_owned()).collect();
+        pack_ids.sort();
+        Slot {
+            slot_id: 1,
+            name: Some("DRAGONS++".into()),
+            game_mode: None,
+            difficulty: None,
+            hardcore: false,
+            seed: None,
+            template_image: None,
+            pack_ids,
+            rules: Vec::new(),
+            active: false,
+            empty: false,
+        }
+    }
+
+    fn stored_from(claims: serde_json::Value) -> StoredWorld {
+        let marketplace_ids = token_packs(&fake_token(claims));
+        let mut pack_ids: Vec<String> = marketplace_ids.iter().map(|(r, _)| r.clone()).collect();
+        pack_ids.sort();
+        pack_ids.dedup();
+        StoredWorld { size_bytes: 1_908_503, pack_ids, marketplace_ids }
+    }
+
+    /// The case from issue #5: the slot shows one world, the service still
+    /// holds the previous occupant, and only the token's pack list says so.
+    #[test]
+    fn a_stale_stored_copy_is_told_apart_by_its_packs() {
+        let stored = stored_from(serde_json::json!({
+            "behaviorPacks": [{ "ref": "c5890e78560f4a4c88567abedf8020ef",
+                                "packId": "216a35d5-e038-4c52-b531-71670c3e219a" }],
+            "resourcePacks": [{ "ref": "f29b7376af8646d5a12cb58140ceec6f",
+                                "packId": "c46327e2-fa4b-4c6d-bc7e-13abc579d54f" }],
+        }));
+        assert_eq!(stored.pack_ids.len(), 2);
+
+        let on_the_slot = slot_with_packs(&[
+            "97a3a3d857ba493dbb5cf1cb6931feb5",
+            "b95f1b02955f4f9db9a3270cc5315f32",
+        ]);
+        assert_eq!(stored.matches_slot(&on_the_slot), Some(false));
+
+        let same_world = slot_with_packs(&[
+            "c5890e78560f4a4c88567abedf8020ef",
+            "f29b7376af8646d5a12cb58140ceec6f",
+        ]);
+        assert_eq!(stored.matches_slot(&same_world), Some(true));
+    }
+
+    /// Silence beats a guess: with no packs on either side there is nothing to
+    /// compare, and an unreadable token must not read as "different world".
+    #[test]
+    fn nothing_to_compare_answers_unknown() {
+        let empty =
+            StoredWorld { size_bytes: 0, pack_ids: Vec::new(), marketplace_ids: Vec::new() };
+        assert_eq!(empty.matches_slot(&slot_with_packs(&["a"])), None);
+
+        let stored = StoredWorld {
+            size_bytes: 0,
+            pack_ids: vec!["a".into()],
+            marketplace_ids: Vec::new(),
+        };
+        assert_eq!(stored.matches_slot(&slot_with_packs(&[])), None);
+
+        for rubbish in ["", "not.a.token", "a.!!!not-base64!!!.c", "a.e30.c"] {
+            assert!(token_packs(rubbish).is_empty(), "{rubbish}");
+        }
+    }
+
+    /// The ids a slot reports exist only inside Realms; the token is what pairs
+    /// them with the marketplace ids this PC's installed packs are keyed by.
+    #[test]
+    fn the_token_pairs_a_slot_id_with_the_marketplace_id() {
+        let stored = stored_from(serde_json::json!({
+            "behaviorPacks": [{ "ref": "151219c841334889b16c4daca429d50d",
+                                "packId": "ffc5f3ad-11b0-4551-b80e-4e7cdd22993c" }],
+            "resourcePacks": [
+                { "ref": "131023e82e9243789de808021e4bbe9c",
+                  "packId": "5aaa8b16-cf1e-4abe-9202-3f749bd89501" },
+                { "ref": "67f6ea41545b48cd90d8a42b81b7239e",
+                  "packId": "9183af09-928c-45b7-9344-4c182cafdd81" },
+            ],
+        }));
+        assert_eq!(stored.marketplace_ids.len(), 3);
+        assert_eq!(
+            stored
+                .marketplace_ids
+                .iter()
+                .find(|(minted, _)| minted == "151219c841334889b16c4daca429d50d")
+                .map(|(_, real)| real.as_str()),
+            Some("ffc5f3ad-11b0-4551-b80e-4e7cdd22993c")
+        );
+
+        // A pack the token describes without a marketplace id is no use and is
+        // left out rather than paired with something invented.
+        let partial = stored_from(serde_json::json!({
+            "resourcePacks": [{ "ref": "abc" }, { "ref": "def", "packId": "real-id" }],
+        }));
+        assert_eq!(partial.marketplace_ids, vec![("def".to_owned(), "real-id".to_owned())]);
     }
 }

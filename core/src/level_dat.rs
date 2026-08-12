@@ -55,6 +55,30 @@ pub fn parse(data: &[u8]) -> Result<WorldMeta> {
 
 #[cfg(test)]
 pub mod test_fixtures {
+    /// A different world: same shape, its own seed.
+    pub fn synthetic_level_dat_with_seed(seed: i64) -> Vec<u8> {
+        let mut out = synthetic_level_dat();
+        let at = out
+            .windows(8)
+            .position(|w| w == (-4406166776699799973i64).to_le_bytes())
+            .expect("the fixture carries a RandomSeed");
+        out[at..at + 8].copy_from_slice(&seed.to_le_bytes());
+        out
+    }
+
+    /// The same world after another session: identical in every way except
+    /// `LastPlayed`, and therefore identical in length. What a world that has
+    /// been played looks like to anything comparing sizes.
+    pub fn synthetic_level_dat_with_last_played(when: i64) -> Vec<u8> {
+        let mut out = synthetic_level_dat();
+        let at = out
+            .windows(8)
+            .position(|w| w == 1754000000i64.to_le_bytes())
+            .expect("the fixture carries a LastPlayed");
+        out[at..at + 8].copy_from_slice(&when.to_le_bytes());
+        out
+    }
+
     /// Build a minimal but structurally faithful Bedrock `level.dat`:
     /// 8-byte header + LE NBT compound with the fields the app reads.
     pub fn synthetic_level_dat() -> Vec<u8> {

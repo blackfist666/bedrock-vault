@@ -72,6 +72,10 @@ struct VaultWorldDto {
     missing_packs: usize,
     backup_count: usize,
     icon: Option<String>,
+    /// Where this world last came from or last went — "minecraft", "realm",
+    /// "file", "backup", or absent for one untouched since the vault started
+    /// recording it.
+    source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -151,6 +155,72 @@ fn world_packs(world_dir: &std::path::Path, index: &HashMap<String, String>) -> 
     (names, unknown)
 }
 
+/// Pack uuid -> the artwork of the world template that bundles it.
+///
+/// A marketplace template ships the world's own picture. A world built from one
+/// and never played on this PC has no `world_icon.jpeg` of its own — Minecraft
+/// writes that when the world is played — but the template that made it does,
+/// and the world names the template's packs, which is what ties the two
+/// together.
+fn template_pictures() -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (_, cache) in packs::find_premium_caches() {
+        let Ok((found, _)) = packs::scan_premium_cache(&cache) else {
+            continue;
+        };
+        let templates: Vec<&packs::Pack> =
+            found.iter().filter(|p| p.category == "world_templates" && p.icon.is_some()).collect();
+        for pack in found.iter().filter(|p| p.category == "template_embedded") {
+            let Some(template) = templates.iter().find(|t| pack.path.starts_with(&t.path)) else {
+                continue;
+            };
+            if let Some(icon) = &template.icon {
+                out.insert(pack.uuid.replace('-', "").to_lowercase(), icon.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The artwork of the marketplace template a world was built from.
+///
+/// A shop banner, not a picture of anyone's world — so it is only ever a
+/// last resort, never a replacement for a real one.
+fn template_art(world_dir: &std::path::Path, templates: &HashMap<String, String>) -> Option<String> {
+    let (resource, behavior) = packs::world_pack_refs(world_dir);
+    resource
+        .into_iter()
+        .chain(behavior)
+        .find_map(|r| templates.get(&r.uuid.replace('-', "").to_lowercase()).cloned())
+}
+
+/// The picture to show for a world, given every copy of it held on this PC.
+///
+/// A real `world_icon.jpeg` always wins, from *whichever* copy has one: the
+/// game writes that picture only for a world played here, so the vault copy of
+/// a world that was played in the game has none while the copy in the game
+/// does. Only when no copy has been played does the template's shop artwork
+/// stand in, and a world with neither shows nothing at all.
+fn world_picture(copies: &[PathBuf], templates: &HashMap<String, String>) -> Option<String> {
+    copies
+        .iter()
+        .find_map(|dir| world_icon(dir))
+        .or_else(|| copies.iter().find_map(|dir| template_art(dir, templates)))
+}
+
+/// Every copy of the world in this folder, that one first.
+fn copies_of(world_dir: &std::path::Path, by_seed: &HashMap<String, Vec<PathBuf>>) -> Vec<PathBuf> {
+    let mut out = vec![world_dir.to_path_buf()];
+    let seed = std::fs::read(world_dir.join("level.dat"))
+        .ok()
+        .and_then(|d| bedrock_vault_core::level_dat::parse(&d).ok())
+        .and_then(|m| m.seed);
+    if let Some(others) = seed.and_then(|s| by_seed.get(&s.to_string())) {
+        out.extend(others.iter().filter(|d| *d != world_dir).cloned());
+    }
+    out
+}
+
 /// A world's `world_icon.jpeg` as a data URI, for the thumbnail in the list.
 ///
 /// Inlined rather than served from disk because the webview's content policy
@@ -200,6 +270,8 @@ async fn game_status() -> Result<Vec<String>, String> {
 
 fn build_overview() -> Result<OverviewDto, String> {
     let index = pack_index();
+    let templates = template_pictures();
+    let by_seed = worlds_by_seed();
     let vault = open_vault()?;
     let library = vault.list().map_err(|e| format!("{e:#}"))?;
 
@@ -242,7 +314,7 @@ fn build_overview() -> Result<OverviewDto, String> {
                 },
                 packs: names,
                 missing_packs: missing,
-                icon: world_icon(&dir),
+                icon: world_picture(&copies_of(&dir, &by_seed), &templates),
                 error,
             });
         }
@@ -266,7 +338,8 @@ fn build_overview() -> Result<OverviewDto, String> {
                 packs: names,
                 missing_packs: missing,
                 backup_count: vault.snapshots(e).len(),
-                icon: world_icon(&e.world_dir),
+                icon: world_picture(&copies_of(&e.world_dir, &by_seed), &templates),
+                source: e.source.clone(),
             }
         })
         .collect();
@@ -417,10 +490,16 @@ async fn back_up(id: String) -> Result<String, String> {
     blocking(move || {
         let vault = open_vault()?;
         let entry = vault.entry(&id).map_err(|e| format!("{e:#}"))?;
-        vault
+        let taken = vault
             .snapshot(&id, &entry.world_dir, &stamp())
             .map_err(|e| format!("{e:#}"))?;
-        Ok(format!("Backed up \"{}\"", entry.name))
+        Ok(match taken {
+            Some(_) => format!("Backed up \"{}\"", entry.name),
+            None => format!(
+                "\"{}\" has not changed since the last backup, so there was no need to make another",
+                entry.name
+            ),
+        })
     })
     .await
 }
@@ -451,18 +530,50 @@ async fn restore(path: String) -> Result<String, String> {
     .await
 }
 
+/// Delete one backup for good. The world it came from is not touched.
+#[tauri::command]
+async fn delete_backup(path: String) -> Result<String, String> {
+    blocking(move || {
+        let vault = open_vault()?;
+        vault
+            .delete_snapshot(std::path::Path::new(&path))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok("That backup is gone".to_owned())
+    })
+    .await
+}
+
 /// Import a `.mcworld` file (from Downloads, a Switch export, anywhere).
 #[tauri::command]
 async fn import(path: String) -> Result<String, String> {
     blocking(move || {
         let vault = open_vault()?;
         let source = PathBuf::from(&path);
-        let entry = if source.is_dir() {
-            vault.import_folder(&source, &stamp())
-        } else {
-            vault.import_mcworld(&source, &stamp())
+        // A file carries no provenance, so identical content is the only claim
+        // worth making: the same world again adds nothing, a world that differs
+        // in any way is kept.
+        if !source.is_dir() {
+            let absorbed = vault
+                .absorb_mcworld(&source, &stamp(), None)
+                .map_err(|e| format!("{e:#}"))?;
+            return Ok(match absorbed {
+                vault::Absorbed::AlreadyHeld(held) => format!(
+                    "\"{}\" is already in your vault, so nothing was added",
+                    held.name
+                ),
+                other => format!("Added \"{}\" to the vault", other.entry().name),
+            });
         }
-        .map_err(|e| format!("{e:#}"))?;
+
+        let entry = vault.import_folder(&source, &stamp()).map_err(|e| format!("{e:#}"))?;
+        let already = vault.find_same_content(&entry.world_dir, &entry.id).unwrap_or(None);
+        if let Some(held) = already {
+            vault.forget(&entry.id).map_err(|e| format!("{e:#}"))?;
+            return Ok(format!(
+                "\"{}\" is already in your vault, so nothing was added",
+                held.name
+            ));
+        }
         Ok(format!("Added \"{}\" to the vault", entry.name))
     })
     .await
@@ -514,9 +625,16 @@ struct SlotDto {
     /// Whether Minecraft will hand this slot's world over, which is what makes
     /// a backup-before-replacing possible.
     can_backup: bool,
+    /// True when the copy Minecraft holds for this slot is a *different* world
+    /// from the one on it now — a previous occupant, never re-backed up after
+    /// the swap. `null` when nothing available says either way.
+    stored_is_older_world: Option<bool>,
     /// Pack names where installed locally, otherwise a short id.
     packs: Vec<PackRefDto>,
     rules: Vec<[String; 2]>,
+    /// The world's own picture, from a copy of it held on this PC, or the
+    /// artwork of the marketplace template it was built from.
+    icon: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -662,22 +780,41 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
         let detail = realms::detail(&session, realm_id).map_err(|e| format!("{e:#}"))?;
         let known = known_packs();
         let by_seed = worlds_by_seed();
+        let templates = template_pictures();
 
         let slots: Vec<SlotDto> = detail
             .slots
             .into_iter()
-            .map(|s| SlotDto {
-                name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
-                packs: name_slot_packs(&s, &known, &by_seed),
-                rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
-                slot_id: s.slot_id,
-                game_mode: s.game_mode,
-                difficulty: s.difficulty,
-                hardcore: s.hardcore,
-                seed: s.seed,
-                active: s.active,
-                can_backup: !s.empty && realms::slot_is_downloadable(&session, realm_id, s.slot_id),
-                empty: s.empty,
+            .map(|s| {
+                // One request answers both questions: whether a copy exists at
+                // all, and whether it is this world or a previous occupant.
+                let stored = if s.empty {
+                    None
+                } else {
+                    realms::stored_world(&session, realm_id, s.slot_id)
+                };
+                let marketplace = stored
+                    .as_ref()
+                    .map(|st| st.marketplace_ids.as_slice())
+                    .unwrap_or(&[]);
+                SlotDto {
+                    name: s.name.clone().unwrap_or_else(|| "Unnamed world".into()),
+                    packs: name_slot_packs(&s, &known, &by_seed, marketplace),
+                    icon: slot_picture(&s, &by_seed, &templates),
+                    rules: s.rules.iter().map(|(k, v)| [k.clone(), v.clone()]).collect(),
+                    can_backup: stored.is_some(),
+                    stored_is_older_world: stored
+                        .as_ref()
+                        .and_then(|st| st.matches_slot(&s))
+                        .map(|same| !same),
+                    slot_id: s.slot_id,
+                    game_mode: s.game_mode,
+                    difficulty: s.difficulty,
+                    hardcore: s.hardcore,
+                    seed: s.seed,
+                    active: s.active,
+                    empty: s.empty,
+                }
             })
             .collect();
 
@@ -708,19 +845,21 @@ async fn realm_detail(realm_id: i64) -> Result<serde_json::Value, String> {
     .await
 }
 
-/// World seed -> a copy of that world held here.
+/// World seed -> every copy of that world held here.
 ///
 /// A Realm slot reports its seed, which identifies which world is on it far
-/// more reliably than a name that anyone can change.
-fn worlds_by_seed() -> HashMap<String, PathBuf> {
-    let mut index = HashMap::new();
+/// more reliably than a name that anyone can change. All the copies are kept,
+/// not just the first: the same world can sit in the vault and in the game at
+/// once, and only one of them may carry the picture or the pack history.
+fn worlds_by_seed() -> HashMap<String, Vec<PathBuf>> {
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut note = |dir: PathBuf| {
         if let Some(seed) = std::fs::read(dir.join("level.dat"))
             .ok()
             .and_then(|d| bedrock_vault_core::level_dat::parse(&d).ok())
             .and_then(|m| m.seed)
         {
-            index.entry(seed.to_string()).or_insert(dir);
+            index.entry(seed.to_string()).or_default().push(dir);
         }
     };
     if let Ok(vault) = open_vault() {
@@ -738,41 +877,104 @@ fn worlds_by_seed() -> HashMap<String, PathBuf> {
     index
 }
 
+/// Copies of a slot's world held on this PC, matched on the seed.
+fn local_copies<'a>(
+    slot: &realms::Slot,
+    by_seed: &'a HashMap<String, Vec<PathBuf>>,
+) -> &'a [PathBuf] {
+    slot.seed
+        .as_ref()
+        .and_then(|seed| by_seed.get(seed))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// A picture for a Realm slot, best first.
+///
+/// Nothing Mojang serves shows what a Realm world looks like: `thumbnailId` is
+/// null on every Realm, and the archive a slot hands over has no
+/// `world_icon.jpeg` in it. But a world played on this PC has one, and a slot's
+/// seed says which local world is the same world — so the picture is the real
+/// one Minecraft draws for it, not an invention. Failing that, a world built
+/// from a marketplace template has the template's artwork, which is the only
+/// image the service itself ever offers.
+fn slot_picture(
+    slot: &realms::Slot,
+    by_seed: &HashMap<String, Vec<PathBuf>>,
+    templates: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(icon) = world_picture(local_copies(slot, by_seed), templates) {
+        return Some(icon);
+    }
+    let url = slot.template_image.as_deref()?;
+    realms::profile::fetch_data_uri(url).ok()
+}
+
 /// Put names to a slot's add-ons.
 ///
-/// Realms mints its own ids for packs attached to a slot; they appear nowhere
-/// locally and no endpoint resolves them. But if a copy of that world is held
-/// here — matched on the seed the slot reports — the world's own pack history
-/// names them, and their order matches the slot's. Where that fails, the kind
-/// of pack is still known, so it says "Resource pack" rather than pretending.
+/// Realms mints its own ids for packs attached to a slot, and they appear
+/// nowhere locally. Three sources, best first:
+///
+/// 1. the slot's download token, which pairs each minted id with the pack's
+///    real marketplace id — the one this PC's installed content is keyed by, so
+///    it brings the proper name *and* the artwork;
+/// 2. a copy of the world held here, matched on the seed the slot reports,
+///    whose own pack history names its add-ons in the slot's order;
+/// 3. nothing, which says "Add-on" rather than pretending.
+///
+/// The token describes the *stored* copy of a slot, which can be a world that
+/// used to be there (see #5) — but its ids are only ever consulted for ids the
+/// slot itself lists, so a stored copy of some other world matches nothing and
+/// names nothing.
 fn name_slot_packs(
     slot: &realms::Slot,
     known: &HashMap<String, (String, Option<String>)>,
-    by_seed: &HashMap<String, PathBuf>,
+    by_seed: &HashMap<String, Vec<PathBuf>>,
+    marketplace: &[(String, String)],
 ) -> Vec<PackRefDto> {
-    let from_world: Vec<String> = slot
-        .seed
-        .as_ref()
-        .and_then(|seed| by_seed.get(seed))
+    // The uuid is kept alongside the name: a world's history records the real
+    // marketplace id, which is what carries the artwork if that pack is
+    // installed here — most of them are, bundled inside their world template.
+    let from_world: Vec<(String, String)> = local_copies(slot, by_seed)
+        .iter()
         .map(|dir| {
-            let mut names: Vec<String> = packs::names_from_history(dir)
-                .into_iter()
-                .map(|(_, name)| name)
-                .collect();
-            names.dedup();
-            names
+            let mut packs = packs::names_from_history(dir);
+            packs.dedup();
+            packs
         })
+        .find(|packs: &Vec<(String, String)>| !packs.is_empty())
         .unwrap_or_default();
+
+    // uuids are written with and without dashes and in either case; compare on
+    // one shape so a match is never missed on punctuation.
+    let key = |id: &str| id.replace('-', "").to_lowercase();
+    let installed = |id: &str| known.get(&key(id)).or_else(|| known.get(&id.replace('-', "")));
 
     slot.pack_ids
         .iter()
         .enumerate()
         .map(|(i, id)| {
-            if let Some(p) = known.get(&id.replace('-', "")) {
+            if let Some(p) = installed(id) {
+                return PackRefDto { name: p.0.clone(), icon: p.1.clone(), installed: true };
+            }
+            // The same pack under the id the marketplace knows it by.
+            if let Some(p) = marketplace
+                .iter()
+                .find(|(minted, _)| key(minted) == key(id))
+                .and_then(|(_, real)| installed(real))
+            {
                 return PackRefDto { name: p.0.clone(), icon: p.1.clone(), installed: true };
             }
             match from_world.get(i).or_else(|| from_world.first()) {
-                Some(name) => PackRefDto { name: name.clone(), icon: None, installed: true },
+                // The world's own record of the pack. Its name is the one the
+                // player already knows it by, so that is kept even when the
+                // pack is installed here — but the artwork comes from the
+                // installed copy, which is the only place it exists.
+                Some((uuid, name)) => PackRefDto {
+                    name: name.clone(),
+                    icon: installed(uuid).and_then(|p| p.1.clone()),
+                    installed: true,
+                },
                 None => PackRefDto { name: "Add-on".to_owned(), icon: None, installed: false },
             }
         })
@@ -961,6 +1163,13 @@ async fn realm_download(
                 .ok_or("could not tell which slot to download")?,
         };
 
+        // What the slot says it is holding, to check the archive against once
+        // it lands. Only the seed is worth trusting: a name can be anything.
+        let expected = realms::detail(&session, realm_id)
+            .ok()
+            .and_then(|d| d.slots.into_iter().find(|s| s.slot_id == slot))
+            .map(|s| (s.name, s.seed));
+
         let download = realms::slot_download(&session, realm_id, slot, None)
             .map_err(|e| format!("{e:#}"))?;
 
@@ -984,10 +1193,44 @@ async fn realm_download(
         })
         .map_err(|e| format!("{e:#}"))?;
 
-        let entry = vault
-            .import_mcworld(&temp, &stamp())
+        // Minecraft serves its own last backup of the slot, which can predate
+        // the world now on it, so say plainly when a different world arrived
+        // rather than banking it under the name that was clicked.
+        let arrived_seed = bedrock_vault_core::mcworld::seed_in_archive(&temp);
+        let wrong_world = match (&expected, arrived_seed) {
+            (Some((_, Some(want))), Some(got)) => want.parse::<i64>().ok() != Some(got),
+            _ => false,
+        };
+
+        // A world copied down from this slot before belongs to the entry it
+        // made then, so a second copy updates that world instead of leaving two
+        // of it in the vault.
+        let absorbed = vault
+            .absorb_mcworld(&temp, &stamp(), Some((realm_id, slot)))
             .map_err(|e| format!("{e:#}"))?;
         std::fs::remove_file(&temp).ok();
+        let entry = absorbed.entry().clone();
+        vault
+            .set_source(&entry.id, vault::SOURCE_REALM)
+            .map_err(|e| format!("{e:#}"))?;
+
+        if matches!(absorbed, vault::Absorbed::AlreadyHeld(_)) {
+            return Ok(format!(
+                "\"{}\" is already in your vault and has not changed since you copied it",
+                entry.name
+            ));
+        }
+        if wrong_world {
+            let on_the_slot = expected
+                .and_then(|(name, _)| name)
+                .unwrap_or_else(|| name.clone());
+            return Ok(format!(
+                "Minecraft's saved copy of slot {slot} is an older world — \"{}\", not \"{}\" — \
+                 so that is what came into your vault. Minecraft only saves a slot again once \
+                 somebody plays there.",
+                entry.name, on_the_slot
+            ));
+        }
         Ok(format!("\"{}\" is now in your vault", entry.name))
     })
     .await
@@ -1015,6 +1258,28 @@ async fn realm_switch_slot(realm_id: i64, slot: i64) -> Result<String, String> {
         let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
         realms::switch_to_slot(&session, realm_id, slot).map_err(|e| format!("{e:#}"))?;
         Ok(format!("The Realm is now playing slot {slot}"))
+    })
+    .await
+}
+
+/// Reopen a Realm that is closed, so people can join it again.
+///
+/// The app can strand a Realm itself: a swap goes close → upload → name →
+/// reopen, and anything that interrupts that — the app being closed mid-upload,
+/// a crash, a dropped connection — leaves it offline. Without this the only way
+/// back was to open it from inside Minecraft, which is the trip the app exists
+/// to save.
+#[tauri::command]
+async fn realm_open(realm_id: i64) -> Result<String, String> {
+    blocking(move || {
+        let session = realms::session(false).map_err(|e| format!("{e:#}"))?;
+        let up = realms::open_and_wait(&session, realm_id).map_err(|e| format!("{e:#}"))?;
+        Ok(if up {
+            "The Realm is open — everyone can join it again".to_owned()
+        } else {
+            "Minecraft is starting the Realm up. It can take a minute — press Refresh to check."
+                .to_owned()
+        })
     })
     .await
 }
@@ -1115,6 +1380,16 @@ async fn realm_upload(
             |_, _| {},
         )
         .map_err(|e| format!("{e:#}"))?;
+
+        // The vault copy is on a Realm now, which is where it was last — and it
+        // is what that slot holds, so copying the slot back down later lands on
+        // this world rather than making another.
+        vault
+            .set_source(&entry.id, vault::SOURCE_REALM)
+            .map_err(|e| format!("{e:#}"))?;
+        vault
+            .set_realm_slot(&entry.id, realm_id, slot)
+            .map_err(|e| format!("{e:#}"))?;
 
         Ok(match saved {
             Some(saved) => format!(
@@ -1220,10 +1495,10 @@ fn main() {
         .manage(PendingLogin::default())
         .invoke_handler(tauri::generate_handler![
             overview, game_status, save_to_vault, save_all, put_away, play, back_up, delete,
-            restore, import, export, open_folder, set_vault_location, realms_overview,
+            restore, delete_backup, import, export, open_folder, set_vault_location, realms_overview,
             realms_begin_login, realms_poll_login, realms_cancel_login, realms_sign_out,
             realm_download, realm_detail, realm_targets, realm_upload, realm_rename_slot,
-            realm_clear_packs, realm_switch_slot, packs_overview, profile, open_url
+            realm_clear_packs, realm_switch_slot, realm_open, packs_overview, profile, open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bedrock Vault");

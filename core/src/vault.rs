@@ -80,6 +80,15 @@ fn default_retention() -> usize {
     5
 }
 
+/// Where a world last came from, or last went: the values [`Meta::source`]
+/// takes, and the whole set the screen knows how to label.
+pub const SOURCE_MINECRAFT: &str = "minecraft";
+pub const SOURCE_REALM: &str = "realm";
+pub const SOURCE_FILE: &str = "file";
+pub const SOURCE_BACKUP: &str = "backup";
+pub const SOURCES: [&str; 4] =
+    [SOURCE_MINECRAFT, SOURCE_REALM, SOURCE_FILE, SOURCE_BACKUP];
+
 /// Provenance and sync state, stored beside each library world.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Meta {
@@ -88,6 +97,15 @@ struct Meta {
     /// Where the world came from: 'local' | 'imported' | 'restored'.
     #[serde(default)]
     origin: String,
+    /// Where this copy last came from or last went — see [`Vault::set_source`].
+    ///
+    /// Not the same question as `origin`, which records how the world first
+    /// entered the vault and never changes. Absent on entries written before
+    /// it existed: unknown, rather than guessed. Kept as a plain string so an
+    /// unrecognised value can never fail the whole file's parse and take the
+    /// rest of an entry's metadata down with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     /// `LastPlayed` of the source when the copy was taken; drives staleness.
     source_last_played: Option<i64>,
     /// When the vault copy was last written.
@@ -104,6 +122,92 @@ struct Meta {
     /// scatter into a fresh group each time it moved.
     #[serde(default)]
     past_folders: Vec<String>,
+    /// [`fingerprint`] of the world when the last snapshot was taken, so an
+    /// unchanged world is not stored again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_fingerprint: Option<String>,
+    /// `<realm id>/<slot>` this world was last copied down from, so copying
+    /// that slot again lands here instead of making a second entry. The same
+    /// job `origin_folder` does for a world that lives in the game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    realm_slot: Option<String>,
+}
+
+/// What a re-sync did, so the screen can say which.
+#[derive(Debug, Clone)]
+pub enum Resync {
+    /// The world that arrived was identical; nothing was touched.
+    Unchanged(LibraryEntry),
+    Replaced(LibraryEntry),
+    /// What arrived is a *different* world from the one this entry holds, so
+    /// nothing was touched. Carries the entry that was left alone.
+    NotTheSameWorld(LibraryEntry),
+}
+
+/// What [`Vault::absorb_mcworld`] did with a world that arrived.
+#[derive(Debug, Clone)]
+pub enum Absorbed {
+    /// The vault already held this exact world; nothing was added.
+    AlreadyHeld(LibraryEntry),
+    /// The world this entry holds had moved on, so its copy was brought up to
+    /// date and what it held before was kept as a backup.
+    Updated(LibraryEntry),
+    Added(LibraryEntry),
+}
+
+impl Absorbed {
+    pub fn entry(&self) -> &LibraryEntry {
+        match self {
+            Absorbed::AlreadyHeld(e) | Absorbed::Updated(e) | Absorbed::Added(e) => e,
+        }
+    }
+}
+
+fn realm_slot_key(realm_id: i64, slot: i64) -> String {
+    format!("{realm_id}/{slot}")
+}
+
+/// A content fingerprint of a world folder: every file's path and bytes.
+///
+/// Deliberately not a cheap proxy. Sizes and timestamps both miss real edits —
+/// a chunk rewritten to the same length, a `level.dat` untouched while the
+/// database moved — and the cost of missing one is a lost backup, so this reads
+/// the world rather than guessing about it. Reading is still an order of
+/// magnitude cheaper than the packing it saves, which is the whole point.
+///
+/// Empty when anything cannot be read, which callers must treat as "cannot
+/// tell" and never as "unchanged".
+fn fingerprint(world_dir: &Path) -> String {
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        // FNV-1a: a few lines, no dependency, and this only has to notice a
+        // difference — nothing here is defending against a forged world.
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+
+    if !world_dir.join("level.dat").is_file() {
+        return String::new();
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    // Sorted, so the same world always hashes the same way whatever order the
+    // filesystem hands the entries back in.
+    for entry in walkdir::WalkDir::new(world_dir).sort_by_file_name() {
+        let Ok(entry) = entry else { return String::new() };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(world_dir) else { return String::new() };
+        let Ok(content) = fs::read(entry.path()) else { return String::new() };
+        feed(&mut hash, rel.to_string_lossy().replace('\\', "/").as_bytes());
+        feed(&mut hash, &content);
+        files += 1;
+        bytes += content.len() as u64;
+    }
+    format!("{files}-{bytes}-{hash:016x}")
 }
 
 pub struct Vault {
@@ -122,6 +226,11 @@ pub struct LibraryEntry {
     pub game_mode: &'static str,
     pub origin_folder: Option<String>,
     pub origin: String,
+    /// Where this copy last came from or last went: one of [`SOURCES`], or
+    /// `None` for a world last touched before the vault recorded it.
+    pub source: Option<String>,
+    /// `<realm id>/<slot>` this world was last copied down from.
+    pub realm_slot: Option<String>,
     pub synced_at: Option<i64>,
     /// `LastPlayed` of the source when this copy was taken.
     pub source_last_played: Option<i64>,
@@ -146,6 +255,35 @@ pub struct BackupGroup {
     pub snapshots: Vec<Snapshot>,
 }
 
+/// What decides that two backup folders hold the same world: its seed and the
+/// name stored with the snapshots.
+///
+/// Seed alone is not enough — every copy of a marketplace map shares one — and
+/// name alone is the thing `all_backups` has always refused, since plenty of
+/// people have three worlds called "My World". Together they are as close to an
+/// identity as a Bedrock world has: nothing in `level.dat` is unique per world.
+///
+/// The seed is written beside the snapshots when they are taken; older folders
+/// pay one archive read and then cache it the same way.
+fn world_identity(dirs: &[PathBuf], snapshots: &[Snapshot]) -> Option<(i64, String)> {
+    let seed = dirs
+        .iter()
+        .find_map(|d| fs::read_to_string(d.join("seed.txt")).ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .or_else(|| {
+            let found = mcworld::seed_in_archive(&snapshots.first()?.path)?;
+            if let Some(dir) = dirs.first() {
+                let _ = fs::write(dir.join("seed.txt"), found.to_string());
+            }
+            Some(found)
+        })?;
+    let name = dirs
+        .iter()
+        .find_map(|d| read_name_file(d))
+        .or_else(|| mcworld::name_in_archive(&snapshots.first()?.path))?;
+    Some((seed, name))
+}
+
 fn read_name_file(dir: &Path) -> Option<String> {
     fs::read_to_string(dir.join("name.txt"))
         .ok()
@@ -156,6 +294,14 @@ fn read_name_file(dir: &Path) -> Option<String> {
 /// A world's name, from `level.dat` with `levelname.txt` as the fallback.
 pub fn world_display_name(world_dir: &Path) -> Option<String> {
     world_name(world_dir)
+}
+
+/// A world's seed: what identifies it when a name cannot be trusted.
+fn world_seed(world_dir: &Path) -> Option<i64> {
+    fs::read(world_dir.join("level.dat"))
+        .ok()
+        .and_then(|d| level_dat::parse(&d).ok())
+        .and_then(|m| m.seed)
 }
 
 /// A world's name, from `level.dat` with `levelname.txt` as the fallback.
@@ -262,6 +408,8 @@ impl Vault {
                 game_mode: level.as_ref().map(|m| m.game_mode_label()).unwrap_or("-"),
                 origin_folder: meta.origin_folder,
                 origin: meta.origin,
+                source: meta.source,
+                realm_slot: meta.realm_slot,
                 synced_at: meta.synced_at,
                 source_last_played: meta.source_last_played,
                 past_folders: meta.past_folders,
@@ -346,6 +494,9 @@ impl Vault {
         if meta.origin.is_empty() {
             meta.origin = "local".into();
         }
+        // Wherever this world came from before, it has just come out of the
+        // game — so that is where it was last.
+        meta.source = Some(SOURCE_MINECRAFT.to_owned());
         meta.source_last_played = live_last_played;
         meta.synced_at = Some(now());
         meta.size_bytes = Some(bytes);
@@ -388,6 +539,8 @@ impl Vault {
         }
         meta.origin_folder = Some(folder_id);
         meta.source_last_played = entry.last_played;
+        // It is in the game now, wherever it came from before.
+        meta.source = Some(SOURCE_MINECRAFT.to_owned());
         self.write_meta(id, &meta)?;
         Ok(dest)
     }
@@ -415,6 +568,189 @@ impl Vault {
         self.finish_import(&id, "imported")
     }
 
+    /// Take a `.mcworld` into the vault without ever storing the same world
+    /// twice.
+    ///
+    /// Every way a world arrives as a file goes through here, because each of
+    /// them minted a fresh entry on its own and the vault filled up with
+    /// identical worlds — five copies of one, from replacing a Realm slot three
+    /// times over.
+    ///
+    /// Two checks, in order of how much they know:
+    ///
+    /// 1. `claim` — the Realm slot this world is coming from. The entry that
+    ///    claims it is this world's, so it is updated rather than joined.
+    /// 2. Identical content, which needs no provenance at all: if the vault
+    ///    already holds these exact bytes, nothing is added. A world that
+    ///    differs in any way is a world worth keeping, and is added as its own
+    ///    entry.
+    pub fn absorb_mcworld(
+        &self,
+        mcworld: &Path,
+        stamp: &str,
+        claim: Option<(i64, i64)>,
+    ) -> Result<Absorbed> {
+        // Set when the slot already has a copy in the vault and what arrived
+        // was a *different* world. The claim stays where it is: an old occupant
+        // of a slot is not the world on it, so it must not inherit the slot.
+        let mut claim_is_spoken_for = false;
+        if let Some((realm_id, slot)) = claim {
+            if let Some(held) = self.find_by_realm_slot(realm_id, slot)? {
+                match self.resync_mcworld(&held.id, mcworld, stamp)? {
+                    Resync::Unchanged(entry) => return Ok(Absorbed::AlreadyHeld(entry)),
+                    Resync::Replaced(entry) => return Ok(Absorbed::Updated(entry)),
+                    // Not an update of anything — fall through and let it stand
+                    // or be recognised on its own merits.
+                    Resync::NotTheSameWorld(_) => claim_is_spoken_for = true,
+                }
+            }
+        }
+        let claim = claim.filter(|_| !claim_is_spoken_for);
+
+        // Unpacking is the same work as inspecting the archive would be, so the
+        // copy is made and then dropped if it turns out to be one the vault has.
+        let fresh = self.import_mcworld(mcworld, stamp)?;
+        if let Some(held) = self.find_same_content(&fresh.world_dir, &fresh.id)? {
+            self.forget(&fresh.id)?;
+            if let Some((realm_id, slot)) = claim {
+                self.set_realm_slot(&held.id, realm_id, slot)?;
+            }
+            return Ok(Absorbed::AlreadyHeld(self.entry(&held.id)?));
+        }
+        if let Some((realm_id, slot)) = claim {
+            self.set_realm_slot(&fresh.id, realm_id, slot)?;
+        }
+        Ok(Absorbed::Added(self.entry(&fresh.id)?))
+    }
+
+    /// Take a `.mcworld` into the entry that already holds this world.
+    ///
+    /// Copying the same world in twice used to leave two identical entries,
+    /// because every import minted a fresh id. Saving from Minecraft has never
+    /// behaved that way — it finds the entry by the world's game folder and
+    /// re-syncs it — and this is the same idea for a world arriving as a file:
+    /// the caller says which entry it belongs to, and the vault updates that
+    /// one, keeping what was there as a backup first.
+    ///
+    /// The staged copy is compared before anything is disturbed, so a repeat of
+    /// a world that has not moved on changes nothing at all.
+    pub fn resync_mcworld(&self, id: &str, mcworld: &Path, stamp: &str) -> Result<Resync> {
+        let entry = self.entry(id)?;
+
+        // The archive a Realm slot hands back is not always that slot's world:
+        // the service serves its own stored copy, which stays as it was until
+        // somebody plays there, so it can be a world that used to be on the
+        // slot. Trusting it replaced one of the player's worlds with a
+        // different one — Maia World became Hardcore Mode — so the seed has to
+        // agree before anything is written. It is the one thing about a world
+        // that cannot be renamed.
+        let arriving = mcworld::seed_in_archive(mcworld);
+        if arriving.is_none() || arriving != world_seed(&entry.world_dir) {
+            return Ok(Resync::NotTheSameWorld(entry));
+        }
+
+        let staged = self.library_dir().join(id).join("world.new");
+        let _ = fs::remove_dir_all(&staged);
+        mcworld::unpack(mcworld, &staged).inspect_err(|_| {
+            let _ = fs::remove_dir_all(&staged);
+        })?;
+
+        let arriving = fingerprint(&staged);
+        let held = fingerprint(&entry.world_dir);
+        if !arriving.is_empty() && arriving == held {
+            let _ = fs::remove_dir_all(&staged);
+            return Ok(Resync::Unchanged(entry));
+        }
+
+        // Keep what is being replaced, exactly as a re-save from the game does.
+        self.snapshot(id, &entry.world_dir, stamp)?;
+        fs::remove_dir_all(&entry.world_dir)?;
+        fs::rename(&staged, &entry.world_dir)?;
+
+        let mut meta = self.read_meta(id);
+        meta.synced_at = Some(now());
+        meta.size_bytes = Some(scan::dir_size(&entry.world_dir));
+        self.write_meta(id, &meta)?;
+        Ok(Resync::Replaced(self.entry(id)?))
+    }
+
+    /// The entry holding the world last copied down from this Realm slot.
+    ///
+    /// Provenance, not guesswork: a re-download of the same slot lands on the
+    /// entry it made last time, and a download from anywhere else never does.
+    /// Worlds that merely look alike — two playthroughs of one marketplace map,
+    /// sharing a seed and a name — are left well alone.
+    pub fn find_by_realm_slot(&self, realm_id: i64, slot: i64) -> Result<Option<LibraryEntry>> {
+        let want = realm_slot_key(realm_id, slot);
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|e| e.realm_slot.as_deref() == Some(want.as_str())))
+    }
+
+    /// Record that this entry is the vault's copy of a Realm slot.
+    ///
+    /// Exactly one entry may claim a slot, so the claim moves rather than being
+    /// shared: sending a different world up to a slot makes *that* world the
+    /// one the slot holds, and the world that used to be there is no longer a
+    /// copy of it.
+    pub fn set_realm_slot(&self, id: &str, realm_id: i64, slot: i64) -> Result<()> {
+        let key = realm_slot_key(realm_id, slot);
+        for other in self.list()? {
+            if other.id != id && other.realm_slot.as_deref() == Some(key.as_str()) {
+                let mut meta = self.read_meta(&other.id);
+                meta.realm_slot = None;
+                self.write_meta(&other.id, &meta)?;
+            }
+        }
+        let mut meta = self.read_meta(id);
+        meta.realm_slot = Some(key);
+        self.write_meta(id, &meta)
+    }
+
+    /// An entry whose world is byte-for-byte what is in this folder.
+    ///
+    /// For a world arriving as a file, where there is no provenance to go on:
+    /// identical content is the one claim that needs no judgement. Name and
+    /// size narrow the field first so this fingerprints one or two worlds
+    /// rather than the whole library. `except` is the entry being checked,
+    /// which would otherwise match itself.
+    pub fn find_same_content(
+        &self,
+        world_dir: &Path,
+        except: &str,
+    ) -> Result<Option<LibraryEntry>> {
+        let arriving = fingerprint(world_dir);
+        if arriving.is_empty() {
+            return Ok(None);
+        }
+        let name = world_name(world_dir);
+        let (_, bytes) = count_and_size(world_dir);
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|e| e.id != except && Some(&e.name) == name.as_ref() && e.size_bytes == bytes)
+            .find(|e| fingerprint(&e.world_dir) == arriving))
+    }
+
+    /// Remove a library entry, keeping nothing.
+    ///
+    /// For a copy that should not have been made — an import of a world the
+    /// vault already holds. [`Vault::delete`] is the one that leaves a final
+    /// snapshot behind; this deliberately is not, because the world it is
+    /// removing still exists under another id.
+    pub fn forget(&self, id: &str) -> Result<()> {
+        if id.is_empty() || Path::new(id).components().count() != 1 {
+            bail!("'{id}' is not a vault id");
+        }
+        let dir = self.library_dir().join(id);
+        if !dir.join("world").join("level.dat").is_file() {
+            bail!("no vault world '{id}'");
+        }
+        fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        Ok(())
+    }
+
     /// Rebuild a world from a snapshot as a **new** library entry.
     ///
     /// Non-destructive by design: rolling back never overwrites the current
@@ -433,14 +769,34 @@ impl Vault {
         let entry = self.entry(id)?;
         let meta = Meta {
             origin_folder: None,
+            source: Some(
+                match origin {
+                    "restored" => SOURCE_BACKUP,
+                    _ => SOURCE_FILE,
+                }
+                .to_owned(),
+            ),
             origin: origin.to_owned(),
             source_last_played: entry.last_played,
             synced_at: Some(now()),
             size_bytes: Some(scan::dir_size(&entry.world_dir)),
             past_folders: Vec::new(),
+            snapshot_fingerprint: None,
+            realm_slot: None,
         };
         self.write_meta(id, &meta)?;
         self.entry(id)
+    }
+
+    /// Record where a world last came from, or last went.
+    ///
+    /// Everything a world can arrive from is already known to the vault except
+    /// a Realm, which the caller holding the session has to say — and it is
+    /// also the one place a world *goes* to, so sending one up sets it too.
+    pub fn set_source(&self, id: &str, source: &str) -> Result<()> {
+        let mut meta = self.read_meta(id);
+        meta.source = Some(source.to_owned());
+        self.write_meta(id, &meta)
     }
 
     /// Remove a world from the library, leaving a final snapshot behind.
@@ -452,10 +808,26 @@ impl Vault {
     }
 
     /// Take a snapshot and prune old ones per the retention setting.
-    pub fn snapshot(&self, id: &str, world_dir: &Path, stamp: &str) -> Result<PathBuf> {
+    ///
+    /// `None` when the world is unchanged since the last snapshot: a second
+    /// copy of identical bytes is not history, it is just disk. One world here
+    /// held three 15 MB archives of the same unplayed world.
+    pub fn snapshot(&self, id: &str, world_dir: &Path, stamp: &str) -> Result<Option<PathBuf>> {
+        let now = fingerprint(world_dir);
+        if let Some(last) = self.read_meta(id).snapshot_fingerprint {
+            // Only skip on a positive match. An unreadable world fingerprints
+            // as nothing, and "cannot tell" must always mean "take the copy".
+            if !now.is_empty() && last == now && !self.snapshots_for_key(id).is_empty() {
+                return Ok(None);
+            }
+        }
+
         let path = self.snapshot_named(id, world_dir, stamp)?;
+        let mut meta = self.read_meta(id);
+        meta.snapshot_fingerprint = Some(now);
+        self.write_meta(id, &meta)?;
         self.prune_snapshots(id)?;
-        Ok(path)
+        Ok(Some(path))
     }
 
     fn snapshot_named(&self, id: &str, world_dir: &Path, stamp: &str) -> Result<PathBuf> {
@@ -464,9 +836,17 @@ impl Vault {
         let out = dir.join(format!("{stamp}.mcworld"));
         mcworld::pack(world_dir, &out)?;
         // Remember the world's name so backups stay identifiable after the
-        // world itself is deleted from the vault.
+        // world itself is deleted from the vault, and its seed so copies of the
+        // same world can be recognised without opening an archive.
         if let Some(name) = world_name(world_dir) {
             let _ = fs::write(dir.join("name.txt"), name);
+        }
+        if let Some(seed) = fs::read(world_dir.join("level.dat"))
+            .ok()
+            .and_then(|d| level_dat::parse(&d).ok())
+            .and_then(|m| m.seed)
+        {
+            let _ = fs::write(dir.join("seed.txt"), seed.to_string());
         }
         Ok(out)
     }
@@ -512,7 +892,9 @@ impl Vault {
             slot.1.push(entry.path());
         }
 
-        let mut groups: Vec<BackupGroup> = merged
+        // (identity, group) — identity is what decides whether two vault ids
+        // are really the same world; see `world_identity`.
+        let mut groups: Vec<(Option<(i64, String)>, BackupGroup)> = merged
             .into_iter()
             .map(|(key, (mut snapshots, dirs))| {
                 snapshots.sort_by(|a, b| b.stamp.cmp(&a.stamp));
@@ -534,16 +916,68 @@ impl Vault {
                         found
                     })
                     .unwrap_or_else(|| "Unknown world".to_owned());
-                BackupGroup { key, name, snapshots }
+                let identity = world_identity(&dirs, &snapshots);
+                (identity, BackupGroup { key, name, snapshots })
             })
             .collect();
 
         groups.sort_by(|a, b| {
-            let a_newest = a.snapshots.first().map(|s| s.stamp.as_str()).unwrap_or("");
-            let b_newest = b.snapshots.first().map(|s| s.stamp.as_str()).unwrap_or("");
-            b_newest.cmp(a_newest)
+            let newest = |g: &BackupGroup| {
+                g.snapshots.first().map(|s| s.stamp.clone()).unwrap_or_default()
+            };
+            newest(&b.1).cmp(&newest(&a.1))
         });
-        groups
+
+        // Fold together the groups holding the same world. One world can end up
+        // under several vault ids — every import and every Realm download mints
+        // a new one — which showed the same world as three separate sections.
+        // The newest group's key and name win, since that is the copy the
+        // player last saw.
+        //
+        // Lineage vetoes a merge: a world that has lived in its own
+        // `minecraftWorlds` folder is a world the game itself keeps separate,
+        // so two groups with folders that do not overlap stay apart however
+        // alike they look. That is what tells two worlds made from the same
+        // marketplace map — same seed, same name — from two copies of one.
+        let folders: std::collections::HashMap<&str, std::collections::HashSet<&str>> = library
+            .iter()
+            .map(|e| {
+                let mut set: std::collections::HashSet<&str> =
+                    e.past_folders.iter().map(String::as_str).collect();
+                set.extend(e.origin_folder.as_deref());
+                (e.id.as_str(), set)
+            })
+            .collect();
+
+        let mut out: Vec<BackupGroup> = Vec::with_capacity(groups.len());
+        let mut seen: Vec<((i64, String), std::collections::HashSet<&str>, usize)> = Vec::new();
+        for (identity, group) in groups {
+            let lineage = folders.get(group.key.as_str()).cloned().unwrap_or_default();
+            let existing = identity.as_ref().and_then(|id| {
+                seen.iter().position(|(seen_id, seen_folders, _)| {
+                    seen_id == id
+                        && (lineage.is_empty()
+                            || seen_folders.is_empty()
+                            || !seen_folders.is_disjoint(&lineage))
+                })
+            });
+            match existing {
+                Some(slot) => {
+                    let (_, seen_folders, at) = &mut seen[slot];
+                    seen_folders.extend(lineage);
+                    let into: &mut BackupGroup = &mut out[*at];
+                    into.snapshots.extend(group.snapshots);
+                    into.snapshots.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+                }
+                None => {
+                    if let Some(id) = identity {
+                        seen.push((id, lineage, out.len()));
+                    }
+                    out.push(group);
+                }
+            }
+        }
+        out
     }
 
     /// Snapshot history for an entry, newest first.
@@ -585,6 +1019,43 @@ impl Vault {
             .collect();
         out.sort_by(|a, b| b.stamp.cmp(&a.stamp));
         out
+    }
+
+    /// Delete one backup for good.
+    ///
+    /// The path arrives from the screen, so it is checked against this vault's
+    /// own backups folder first: nothing outside it, and nothing that is not a
+    /// snapshot, can be removed through here. Unlike deleting a world, there is
+    /// no copy left behind — this *is* the copy.
+    pub fn delete_snapshot(&self, snapshot: &Path) -> Result<()> {
+        let backups = self
+            .backups_dir()
+            .canonicalize()
+            .with_context(|| format!("reading {}", self.backups_dir().display()))?;
+        let target = snapshot
+            .canonicalize()
+            .with_context(|| format!("that backup is no longer at {}", snapshot.display()))?;
+        if !target.starts_with(&backups)
+            || target.extension().is_none_or(|x| x != "mcworld")
+            || !target.is_file()
+        {
+            bail!("{} is not a backup in this vault", snapshot.display());
+        }
+        fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
+
+        // Once the last snapshot of a world is gone the folder holds only the
+        // remembered name, which is no use on its own.
+        if let Some(dir) = target.parent().filter(|d| *d != backups) {
+            let empty = fs::read_dir(dir).map(|mut entries| {
+                !entries.any(|e| {
+                    e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "mcworld"))
+                })
+            });
+            if empty.unwrap_or(false) {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+        Ok(())
     }
 
     fn prune_snapshots(&self, id: &str) -> Result<()> {
@@ -787,9 +1258,18 @@ mod tests {
             b"MANIFEST-000002\n",
             "vault copy should hold the newer data"
         );
-        assert!(
-            vault.snapshots(&second).len() >= 2,
-            "history keeps the pre-sync snapshot"
+        // The pre-sync state is in history — held by the snapshot the first
+        // save took, since the vault copy did not change in between. Checked by
+        // reading it back rather than by counting files, because a second copy
+        // of those same bytes would be storage, not history.
+        let snapshots = vault.snapshots(&second);
+        assert_eq!(snapshots.len(), 1, "no duplicate of an unchanged copy");
+        let restored = base.join("readback");
+        mcworld::unpack(&snapshots[0].path, &restored).unwrap();
+        assert_eq!(
+            fs::read(restored.join("db").join("CURRENT")).unwrap(),
+            b"MANIFEST-000001\n",
+            "history keeps the pre-sync world"
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -842,6 +1322,115 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// The tag follows the world about: it says where it last was, not how it
+    /// first arrived, so re-saving from the game overwrites "realm".
+    #[test]
+    fn source_follows_where_the_world_last_was() {
+        let base = temp("source");
+        let live = base.join("minecraftWorlds").join("abc=");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let entry = vault.protect(&live, "abc=", "20260811-100000").unwrap();
+        assert_eq!(entry.source.as_deref(), Some(SOURCE_MINECRAFT));
+
+        // A Realm download is an import as far as the vault is concerned, so
+        // the caller with the session has to say where it really came from.
+        vault.set_source(&entry.id, SOURCE_REALM).unwrap();
+        assert_eq!(vault.entry(&entry.id).unwrap().source.as_deref(), Some(SOURCE_REALM));
+
+        // Saved out of the game again: it was last in Minecraft.
+        let resaved = vault.protect(&live, "abc=", "20260811-110000").unwrap();
+        assert_eq!(resaved.id, entry.id, "the same world, not a second entry");
+        assert_eq!(resaved.source.as_deref(), Some(SOURCE_MINECRAFT));
+
+        let mcworld = base.join("shared.mcworld");
+        mcworld::pack(&entry.world_dir, &mcworld).unwrap();
+        let imported = vault.import_mcworld(&mcworld, "20260811-120000").unwrap();
+        assert_eq!(imported.source.as_deref(), Some(SOURCE_FILE));
+
+        let snapshot = vault.snapshots(&entry).first().unwrap().path.clone();
+        let restored = vault.restore_snapshot(&snapshot, "20260811-130000").unwrap();
+        assert_eq!(restored.source.as_deref(), Some(SOURCE_BACKUP));
+
+        // A world saved before the vault recorded any of this stays unknown
+        // rather than being labelled with a guess.
+        let old = vault.library_dir().join(&entry.id).join("meta.json");
+        fs::write(&old, r#"{"origin":"local","past_folders":[]}"#).unwrap();
+        assert_eq!(vault.entry(&entry.id).unwrap().source, None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deleting_a_backup_removes_that_file_and_nothing_else() {
+        let base = temp("delbackup");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+        let entry = vault.protect(&live, "abc=", "20260811-100000").unwrap();
+        fs::write(entry.world_dir.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        vault.snapshot(&entry.id, &entry.world_dir, "20260811-110000").unwrap();
+
+        let snaps = vault.snapshots_for_key(&entry.id);
+        assert_eq!(snaps.len(), 2);
+        vault.delete_snapshot(&snaps[0].path).unwrap();
+        let left = vault.snapshots_for_key(&entry.id);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].stamp, snaps[1].stamp);
+        assert!(vault.list().unwrap().len() == 1, "the world itself is untouched");
+
+        // Anything outside the vault's backups folder is refused, so a path
+        // coming from the screen can never reach the world itself.
+        assert!(vault.delete_snapshot(&entry.world_dir.join("level.dat")).is_err());
+        assert!(entry.world_dir.join("level.dat").is_file());
+
+        // The last one out takes the folder with it.
+        vault.delete_snapshot(&left[0].path).unwrap();
+        assert!(!vault.backups_dir().join(&entry.id).exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The reported case: three 15 MB archives of the same unplayed world.
+    #[test]
+    fn an_unchanged_world_is_not_stored_again() {
+        let base = temp("nodupe");
+        let live = base.join("minecraftWorlds").join("abc=");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let entry = vault.protect(&live, "abc=", "20260811-100000").unwrap();
+        assert_eq!(vault.snapshots_for_key(&entry.id).len(), 1);
+
+        // Saving and backing up again, with nothing touched in between.
+        assert!(vault.snapshot(&entry.id, &entry.world_dir, "20260811-110000").unwrap().is_none());
+        vault.protect(&live, "abc=", "20260811-120000").unwrap();
+        assert_eq!(
+            vault.snapshots_for_key(&entry.id).len(),
+            1,
+            "the same bytes must not be stored twice"
+        );
+
+        // Play it, and the copy is worth keeping again. Only `level.dat`
+        // changes here, and every file keeps its length — the case a
+        // size-and-count fingerprint would miss.
+        let played = level_dat::test_fixtures::synthetic_level_dat_with_last_played(1754999999);
+        assert_eq!(
+            played.len(),
+            fs::read(entry.world_dir.join("level.dat")).unwrap().len(),
+            "the fixture must differ in content but not in size"
+        );
+        fs::write(entry.world_dir.join("level.dat"), &played).unwrap();
+        assert!(vault.snapshot(&entry.id, &entry.world_dir, "20260811-130000").unwrap().is_some());
+        assert_eq!(vault.snapshots_for_key(&entry.id).len(), 2);
+
+        // A world whose folder cannot be read must never read as "unchanged".
+        assert!(fingerprint(&base.join("nowhere")).is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn retention_prunes_old_snapshots_but_keeps_deletions() {
         let base = temp("retention");
@@ -851,12 +1440,20 @@ mod tests {
         vault.settings.snapshot_retention = 2;
 
         let entry = vault.protect(&live, "abc=", "20260810-100000").unwrap();
-        for stamp in ["20260810-110000", "20260810-120000", "20260810-130000"] {
+        // The world has to actually change between saves, or the vault rightly
+        // refuses to store the same bytes again and there is nothing to prune.
+        for (n, stamp) in ["20260810-110000", "20260810-120000", "20260810-130000"]
+            .iter()
+            .enumerate()
+        {
+            fs::write(entry.world_dir.join("db").join("CURRENT"), format!("MANIFEST-{n}\n"))
+                .unwrap();
             vault.snapshot(&entry.id, &entry.world_dir, stamp).unwrap();
         }
         assert_eq!(vault.snapshots_for_key(&entry.id).len(), 2);
 
         vault.snapshot_named(&entry.id, &entry.world_dir, "20260810-140000-deleted").unwrap();
+        fs::write(entry.world_dir.join("db").join("CURRENT"), b"MANIFEST-later\n").unwrap();
         vault.snapshot(&entry.id, &entry.world_dir, "20260810-150000").unwrap();
         let stamps: Vec<_> = vault.snapshots_for_key(&entry.id).into_iter().map(|s| s.stamp).collect();
         assert!(
@@ -924,7 +1521,244 @@ mod tests {
         let archived = vault.archive(&live, "9Ysgap55yI8=", "20260810-110000").unwrap();
         let after = vault.all_backups(&vault.list().unwrap());
         assert_eq!(after.len(), 1, "archiving must not split the history: {after:#?}");
-        assert_eq!(vault.snapshots(&archived).len(), 3);
+        // Two, not three: archiving re-saved a world that had not changed, and
+        // the copy of it already in history is the same bytes.
+        assert_eq!(vault.snapshots(&archived).len(), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The reported case: copying one Realm slot twice left two identical
+    /// worlds in the vault.
+    #[test]
+    fn copying_a_realm_slot_again_updates_the_world_it_made() {
+        let base = temp("realmresync");
+        let live = base.join("w");
+        make_world(&live, "Hardcore Mode");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let download = base.join("slot.mcworld");
+        mcworld::pack(&live, &download).unwrap();
+        let first = vault.import_mcworld(&download, "20260811-131714").unwrap();
+        vault.set_realm_slot(&first.id, 34391948, 2).unwrap();
+
+        // The same slot again, nothing played in between.
+        let held = vault.find_by_realm_slot(34391948, 2).unwrap().expect("the slot's world");
+        assert_eq!(held.id, first.id);
+        match vault.resync_mcworld(&held.id, &download, "20260811-134109").unwrap() {
+            Resync::Unchanged(entry) => assert_eq!(entry.id, first.id),
+            other => panic!("an identical world must change nothing: {other:?}"),
+        }
+        assert_eq!(vault.list().unwrap().len(), 1, "no second copy of one world");
+        assert!(
+            vault.snapshots_for_key(&first.id).is_empty(),
+            "and nothing worth backing up happened"
+        );
+
+        // Played on the Realm since: the same entry moves on, and what it held
+        // is kept.
+        fs::write(live.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let newer = base.join("slot-later.mcworld");
+        mcworld::pack(&live, &newer).unwrap();
+        match vault.resync_mcworld(&first.id, &newer, "20260811-140000").unwrap() {
+            Resync::Replaced(entry) => assert_eq!(entry.id, first.id),
+            other => panic!("a changed world must replace the copy: {other:?}"),
+        }
+        assert_eq!(vault.list().unwrap().len(), 1);
+        assert_eq!(
+            fs::read(first.world_dir.join("db").join("CURRENT")).unwrap(),
+            b"MANIFEST-000002\n"
+        );
+        assert_eq!(
+            vault.snapshots_for_key(&first.id).len(),
+            1,
+            "the copy that was replaced is kept as a backup"
+        );
+
+        // A different slot is a different world, however alike it looks.
+        assert!(vault.find_by_realm_slot(34391948, 3).unwrap().is_none());
+
+        // Sending a different world up to that slot moves the claim, so only
+        // ever one world is the vault's copy of a slot.
+        let other = vault.import_mcworld(&newer, "20260811-150000").unwrap();
+        vault.set_realm_slot(&other.id, 34391948, 2).unwrap();
+        assert_eq!(vault.find_by_realm_slot(34391948, 2).unwrap().map(|e| e.id), Some(other.id));
+        assert_eq!(vault.entry(&first.id).unwrap().realm_slot, None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The reported case: swapping a Realm's world three times left five
+    /// identical copies of one world in the vault. Each replacement saved the
+    /// slot's current world first, and the service kept handing back the same
+    /// archive — its stored copy of a slot only changes when somebody plays
+    /// there — so every swap imported a world the vault already had.
+    #[test]
+    fn absorbing_the_same_world_repeatedly_adds_it_once() {
+        let base = temp("absorb");
+        let live = base.join("w");
+        make_world(&live, "Hardcore Mode");
+        let vault = Vault::open(base.join("vault")).unwrap();
+        let download = base.join("slot.mcworld");
+        mcworld::pack(&live, &download).unwrap();
+
+        // No claim recorded — how the copies in the wild were made.
+        let first = vault.absorb_mcworld(&download, "20260811-140012", None).unwrap();
+        assert!(matches!(first, Absorbed::Added(_)));
+        for stamp in ["20260811-140053", "20260811-140118", "20260811-140200"] {
+            match vault.absorb_mcworld(&download, stamp, None).unwrap() {
+                Absorbed::AlreadyHeld(entry) => assert_eq!(entry.id, first.entry().id),
+                other => panic!("identical bytes must not be stored again: {other:?}"),
+            }
+        }
+        assert_eq!(vault.list().unwrap().len(), 1, "one world, one entry");
+
+        // A world that differs in any way is a world worth keeping.
+        fs::write(live.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let moved_on = base.join("slot-later.mcworld");
+        mcworld::pack(&live, &moved_on).unwrap();
+        let added = vault.absorb_mcworld(&moved_on, "20260811-150000", None).unwrap();
+        assert!(matches!(added, Absorbed::Added(_)), "no claim, so it stands alone");
+        assert_eq!(vault.list().unwrap().len(), 2);
+
+        // With a claim, the same arrival updates the slot's world instead.
+        vault.set_realm_slot(first.entry().id.as_str(), 34391948, 2).unwrap();
+        let updated = vault
+            .absorb_mcworld(&moved_on, "20260811-160000", Some((34391948, 2)))
+            .unwrap();
+        assert!(matches!(updated, Absorbed::Updated(_)));
+        assert_eq!(updated.entry().id, first.entry().id);
+        assert_eq!(vault.list().unwrap().len(), 2, "updated, not added");
+        assert_eq!(
+            vault.snapshots_for_key(&first.entry().id).len(),
+            1,
+            "and what it replaced is kept"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// What went wrong in the wild, reproduced: an entry was the vault's copy
+    /// of a Realm slot, the slot handed back a *different* world — its stored
+    /// copy was a previous occupant, never re-backed up — and that world was
+    /// written over the entry. One player's Maia World became Hardcore Mode.
+    #[test]
+    fn a_slot_serving_a_different_world_never_overwrites_the_entry() {
+        let base = temp("wrongworld");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let mine = base.join("mine");
+        make_world(&mine, "Maia World (10) - Copy");
+        let mine_archive = base.join("mine.mcworld");
+        mcworld::pack(&mine, &mine_archive).unwrap();
+        let held = vault.absorb_mcworld(&mine_archive, "20260811-090000", None).unwrap();
+        let held = held.entry().clone();
+        vault.set_realm_slot(&held.id, 34391948, 2).unwrap();
+
+        // The slot's stored copy is a world that used to be there.
+        let stale = base.join("stale");
+        make_world(&stale, "Hardcore Mode");
+        fs::write(
+            stale.join("level.dat"),
+            level_dat::test_fixtures::synthetic_level_dat_with_seed(-1920971761),
+        )
+        .unwrap();
+        let stale_archive = base.join("stale.mcworld");
+        mcworld::pack(&stale, &stale_archive).unwrap();
+
+        let absorbed = vault
+            .absorb_mcworld(&stale_archive, "20260811-144832", Some((34391948, 2)))
+            .unwrap();
+        assert!(matches!(absorbed, Absorbed::Added(_)), "it is its own world: {absorbed:?}");
+        assert_ne!(absorbed.entry().id, held.id);
+        // And it does not inherit the slot: an old occupant is not the world
+        // on it, so the copy that is stays the slot's.
+        assert_eq!(vault.find_by_realm_slot(34391948, 2).unwrap().map(|e| e.id), Some(held.id.clone()));
+
+        // The claimed entry is untouched — not replaced, and not even
+        // snapshotted. Judged on the seed: both fixtures carry the same
+        // `LevelName`, which is exactly the case a name could not tell apart.
+        let after = vault.entry(&held.id).unwrap();
+        assert_eq!(after.name, held.name);
+        assert_eq!(world_seed(&after.world_dir), world_seed(&mine));
+        assert_ne!(world_seed(&after.world_dir), world_seed(&stale));
+        assert!(vault.snapshots_for_key(&held.id).is_empty());
+
+        // The same world moving on still updates it, which is the point of the
+        // claim in the first place.
+        fs::write(mine.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let moved_on = base.join("mine-later.mcworld");
+        mcworld::pack(&mine, &moved_on).unwrap();
+        let updated = vault
+            .absorb_mcworld(&moved_on, "20260811-150000", Some((34391948, 2)))
+            .unwrap();
+        assert!(matches!(updated, Absorbed::Updated(_)), "{updated:?}");
+        assert_eq!(updated.entry().id, held.id);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A file carries no provenance, so only identical content counts.
+    #[test]
+    fn an_identical_import_is_recognised_and_a_different_one_is_not() {
+        let base = temp("sameimport");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let mcworld = base.join("shared.mcworld");
+        mcworld::pack(&live, &mcworld).unwrap();
+        let first = vault.import_mcworld(&mcworld, "20260811-100000").unwrap();
+        let second = vault.import_mcworld(&mcworld, "20260811-110000").unwrap();
+
+        let held = vault.find_same_content(&second.world_dir, &second.id).unwrap();
+        assert_eq!(held.map(|e| e.id), Some(first.id.clone()));
+
+        vault.forget(&second.id).unwrap();
+        assert_eq!(vault.list().unwrap().len(), 1);
+        assert!(!vault.library_dir().join(&second.id).exists());
+        assert!(
+            vault.snapshots_for_key(&second.id).is_empty(),
+            "forgetting a copy leaves no backup: the world is still here"
+        );
+
+        // A world that only looks similar is left alone.
+        fs::write(first.world_dir.join("db").join("CURRENT"), b"MANIFEST-000002\n").unwrap();
+        let changed = vault.import_mcworld(&mcworld, "20260811-120000").unwrap();
+        assert!(vault.find_same_content(&changed.world_dir, &changed.id).unwrap().is_none());
+
+        // And a vault id is the only thing `forget` will touch.
+        assert!(vault.forget("../library").is_err());
+        assert!(vault.forget("").is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The reported case: the same world copied in twice showed up as two
+    /// sections, because every import mints a fresh vault id.
+    #[test]
+    fn copies_of_one_world_share_a_backup_section() {
+        let base = temp("mergecopies");
+        let live = base.join("w");
+        make_world(&live, "Spike Test World");
+        let vault = Vault::open(base.join("vault")).unwrap();
+
+        let mcworld = base.join("shared.mcworld");
+        mcworld::pack(&live, &mcworld).unwrap();
+        let first = vault.import_mcworld(&mcworld, "20260811-100000").unwrap();
+        vault.snapshot(&first.id, &first.world_dir, "20260811-100100").unwrap();
+        let second = vault.import_mcworld(&mcworld, "20260811-120000").unwrap();
+        vault.snapshot(&second.id, &second.world_dir, "20260811-120100").unwrap();
+        assert_ne!(first.id, second.id, "each import is its own vault entry");
+
+        let groups = vault.all_backups(&vault.list().unwrap());
+        assert_eq!(groups.len(), 1, "one world, one section: {groups:#?}");
+        assert_eq!(groups[0].snapshots.len(), 2, "both copies' history is there");
+        assert_eq!(groups[0].key, second.id, "the newest copy names the section");
+
+        // The seed is cached beside the snapshots so this costs no archive
+        // reads next time.
+        assert!(vault.backups_dir().join(&first.id).join("seed.txt").is_file());
 
         let _ = fs::remove_dir_all(&base);
     }

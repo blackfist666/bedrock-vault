@@ -28,7 +28,7 @@ const TOUCHES = {
 
 const EXPLAIN = {
   live: "These are the worlds Minecraft can see right now. Put one away to tidy up the in-game list — it stays safe in the vault.",
-  vault: "Every world you own lives here. Press Play to put one into Minecraft. Nothing here is lost when you tidy up your game.",
+  vault: "Every world you own lives here. Press Send to Minecraft to put one into the game. Nothing here is lost when you tidy up your game.",
   backups: "Older copies of your worlds, kept automatically. If a world goes wrong, restore a copy from before it happened.",
   packs: "Everything from the Marketplace that is installed on this PC, and which of your worlds uses it.",
   realms: "Your Realm and what is on it. Copy a Realm's world into your vault at any time.",
@@ -204,7 +204,7 @@ function liveRows() {
       help: "Save it to the vault and take it out of Minecraft's world list.",
       onClick: () => confirmRun(
         `Put "${w.name}" away?`,
-        "It goes into the vault and disappears from Minecraft's world list. Press Play in the Vault to bring it back whenever you like.",
+        "It goes into the vault and disappears from Minecraft's world list. Press Send to Minecraft in the Vault to bring it back whenever you like.",
         "Yes, put it away", "put_away", { folder: w.folder }),
     }));
 
@@ -223,13 +223,27 @@ function liveRows() {
   });
 }
 
+/// Where a vault world last came from, or last went — in the same colours the
+/// buttons use for those places. Worlds last touched before the vault started
+/// recording this get no chip rather than a guess.
+const SOURCE_CHIPS = {
+  minecraft: { text: "MC", kind: "mode" },
+  realm: { text: "REALM", kind: "realm" },
+  file: { text: "FILE", kind: "" },
+  backup: { text: "BACKUP", kind: "" },
+};
+
+function sourceChip(source) {
+  return SOURCE_CHIPS[source] || null;
+}
+
 function vaultRows() {
   const blocked = state.data.game_running.length > 0;
   const reason = "Close Minecraft first";
   return state.data.vault.filter((w) => matches(w.name)).map((w) => {
     const actions = [];
     if (!w.in_game) {
-      actions.push(button("Play here", {
+      actions.push(button("Send to Minecraft", {
         className: TOUCHES.minecraft, disabled: blocked, disabledReason: reason,
         help: "Copy this world into Minecraft on this PC, so it appears in your single-player world list.",
         onClick: () => run("play", { id: w.id }),
@@ -267,6 +281,7 @@ function vaultRows() {
       name: w.name,
       chips: [
         { text: w.mode, kind: "mode" },
+        sourceChip(w.source),
         w.in_game ? { text: "In Minecraft now", kind: "live" } : null,
         w.backup_count ? { text: `${w.backup_count} backup${w.backup_count > 1 ? "s" : ""}` } : null,
         w.missing_packs ? { text: `${w.missing_packs} add-on${w.missing_packs > 1 ? "s" : ""} missing`, kind: "warn" } : null,
@@ -299,6 +314,17 @@ function backupRows() {
           `The copy from ${b.label} is added to the vault as a separate world, so nothing you have now is changed or lost.`,
           "Yes, restore it", "restore", { path: b.path }),
       }));
+      line.append(button("Delete", {
+        className: TOUCHES.warning,
+        help: "Throw this older copy away. The world itself is not touched.",
+        onClick: () => confirmRun(
+          `Delete the copy of "${g.name}" from ${b.label}?`,
+          "This copy is thrown away for good and cannot be brought back." +
+          (g.backups.length === 1
+            ? ` It is the last copy of "${g.name}" kept in Backups.`
+            : " The other copies are not touched."),
+          "Yes, delete it", "delete_backup", { path: b.path }),
+      }));
       list.append(line);
     }
     main.append(list);
@@ -315,7 +341,19 @@ function realmHero(realm) {
   const title = el("div", "hero-title");
   title.append(el("h2", null, realm.name));
   const sub = el("div", "hero-sub");
-  sub.append(el("span", `chip ${realm.state === "OPEN" ? "mode" : ""}`, realm.state === "OPEN" ? "Open" : "Closed"));
+  // A Realm of your own that is closed is usually not deliberate — the app
+  // itself can leave one that way if a swap is interrupted — so it is called
+  // out in amber with the one button that fixes it, rather than sitting
+  // quietly in grey.
+  const isOpen = realm.state === "OPEN";
+  sub.append(el("span", `chip ${isOpen ? "mode" : "warn"}`, isOpen ? "Open" : "Closed"));
+  if (!isOpen && realm.can_download) {
+    sub.append(button("Open", {
+      className: TOUCHES.realm,
+      help: "Start the Realm again so everyone can join it.",
+      onClick: () => run("realm_open", { realmId: realm.id }),
+    }));
+  }
   sub.append(el("span", `chip ${realm.expired ? "warn" : "saved"}`, realm.subscription));
   sub.append(el("span", "chip", `Up to ${realm.max_players ?? "?"} players`));
   title.append(sub);
@@ -342,8 +380,12 @@ function realmHero(realm) {
   head.append(actions);
   card.append(head);
 
+  // `loading` matters as much as `undefined`: the slots take a second or two
+  // to arrive, and anything that redraws in the meantime — typing in the
+  // search box, the game-running poll, Refresh — would otherwise read the
+  // placeholder as a loaded Realm and throw on its missing slot list.
   const detail = state.realmDetail[realm.id];
-  if (!detail) {
+  if (!detail || detail.loading) {
     card.append(el("div", "hero-loading", "Loading worlds…"));
     loadRealmDetail(realm.id);
     return card;
@@ -379,6 +421,14 @@ function realmHero(realm) {
       continue;
     }
 
+    // Only shown when there is a real picture of this world to show: a copy of
+    // it on this PC, or the artwork of the template it was built from.
+    if (slot.icon) {
+      const shot = el("img", "slot-shot");
+      shot.src = slot.icon;
+      shot.alt = "";
+      s.append(shot);
+    }
     s.append(el("div", "slot-name", slot.name));
 
     const facts = el("div", "chips");
@@ -410,6 +460,12 @@ function realmHero(realm) {
     if (!slot.can_backup) {
       s.append(el("div", "slot-warn",
         "Minecraft has no saved copy of this world yet, so it cannot be copied to your vault."));
+    } else if (slot.stored_is_older_world) {
+      // Minecraft only saves a slot again once somebody plays there, so the
+      // copy it holds can still be the world that was here before.
+      s.append(el("div", "slot-warn",
+        `Minecraft's saved copy of this slot is an older world, not "${slot.name}". ` +
+        "Copying it would bring that older world into your vault."));
     }
 
     if (realm.can_download) {
@@ -439,12 +495,20 @@ function realmHero(realm) {
           (name) => run("realm_rename_slot", { realmId: realm.id, slot: slot.slot_id, name })),
       }));
       if (slot.can_backup) {
-        slotActions.append(button("Copy to vault", {
+        const older = slot.stored_is_older_world;
+        slotActions.append(button(older ? "Copy older world" : "Copy to vault", {
           className: TOUCHES.vault,
-          help: "Download this slot's world into your vault. Nothing on the Realm changes.",
+          help: older
+            ? "Download the older world Minecraft still has saved for this slot."
+            : "Download this slot's world into your vault. Nothing on the Realm changes.",
           onClick: () => confirmRun(
-            `Copy "${slot.name}" into your vault?`,
-            "The world is downloaded and added to your vault. Nothing on the Realm is changed.",
+            older
+              ? `Copy the older world saved for slot ${slot.slot_id}?`
+              : `Copy "${slot.name}" into your vault?`,
+            older
+              ? `Minecraft's saved copy of this slot is not "${slot.name}" — it is a world that ` +
+                "was here before. That older world is what lands in your vault. Nothing on the Realm is changed."
+              : "The world is downloaded and added to your vault. Nothing on the Realm is changed.",
             "Yes, copy it", "realm_download",
             { realmId: realm.id, slot: slot.slot_id, name: slot.name }),
         }));
@@ -740,6 +804,10 @@ async function loadRealmTargets() {
   }
 }
 
+/// Ask the Realms service what is on each Realm now.
+///
+/// Nothing here is cached between calls, so this is also the refresh: the
+/// per-Realm detail is dropped so each hero fetches its slots again.
 async function loadRealms() {
   try {
     state.realms = await invoke("realms_overview");
@@ -752,9 +820,29 @@ async function loadRealms() {
     state.profile = r.profile || state.profile;
     state.realmTargets = r.mine;
     renderAccount();
+    return true;
   } catch (e) {
     banner(String(e), "error");
+    return false;
   }
+}
+
+/// The Refresh button on the Realms page.
+///
+/// A Realm changes while the app is open — someone loads a different world on
+/// it from inside Minecraft, or makes a new one — and nothing tells the app
+/// that happened, so this is how the page catches up without a restart.
+async function refreshRealms() {
+  if (state.busy) return;
+  state.busy = true;
+  render();
+  showProgress("Checking your Realms…", 0, 0);
+  const ok = await loadRealms();
+  state.busy = false;
+  hideProgress();
+  // A Realm that answered but reported a problem shows it in the list itself.
+  if (ok && !state.realms?.error) banner("Your Realms are up to date", "ok");
+  render();
 }
 
 function render() {
@@ -768,7 +856,7 @@ function render() {
   }[state.section]();
   if (!rows.length) {
     const empty = {
-      live: "No worlds in Minecraft right now. Press Play on a vault world to add one.",
+      live: "No worlds in Minecraft right now. Press Send to Minecraft on a vault world to add one.",
       vault: "The vault is empty. Save a world from Minecraft, or import a .mcworld file.",
       backups: "No backups yet. They are made automatically whenever a world is saved.",
       packs: "No marketplace content is installed on this PC.",
@@ -777,6 +865,14 @@ function render() {
     grid.append(el("div", "empty", state.search ? "Nothing matches that name." : empty));
   }
   for (const r of rows) grid.append(r);
+
+  // Only the Realms page has something to re-read from a server; the Packs
+  // page carries its own Refresh as the main action.
+  const refresh = document.getElementById("refresh-action");
+  const canRefresh = state.section === "realms" && state.realms?.signed_in && !state.login;
+  refresh.style.display = canRefresh ? "" : "none";
+  refresh.disabled = state.busy;
+  refresh.onclick = refreshRealms;
 
   const main = document.getElementById("main-action");
   main.style.display = "";
@@ -834,11 +930,13 @@ async function run(cmd, args) {
   const label = {
     save_all: "Saving worlds", save_to_vault: "Saving to the vault", put_away: "Putting away",
     play: "Getting it ready", back_up: "Backing up", export: "Making a copy",
-    restore: "Restoring", delete: "Deleting", import: "Importing",
+    restore: "Restoring", delete: "Deleting", delete_backup: "Deleting that copy",
+    import: "Importing",
     set_vault_location: "Moving the vault", open_folder: "Opening",
     realms_sign_out: "Signing out", realm_download: "Downloading from the Realm",
     realm_upload: "Sending to the Realm", realm_rename_slot: "Renaming",
     realm_clear_packs: "Updating the Realm", realm_switch_slot: "Switching world",
+    realm_open: "Opening the Realm",
   }[cmd] || "Working";
   showProgress(`${label}…`, 0, 0);
   try {
@@ -1022,7 +1120,7 @@ function confirmRun(title, body, okLabel, cmd, args) {
   // clicked on the row is the colour they confirm with.
   ok.className = `mc-btn ${
     cmd.startsWith("realm_") || cmd.startsWith("realms_") ? TOUCHES.realm
-    : cmd === "delete" || cmd === "realm_clear_packs" ? TOUCHES.warning
+    : cmd === "delete" || cmd === "delete_backup" || cmd === "realm_clear_packs" ? TOUCHES.warning
     : cmd === "put_away" || cmd === "play" ? TOUCHES.minecraft
     : TOUCHES.vault}`;
   ok.style.display = "";

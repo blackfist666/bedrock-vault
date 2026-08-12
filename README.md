@@ -6,10 +6,11 @@ See [DESIGN.md](DESIGN.md) for the full design.
 
 ## Status
 
-**v0.1.0** — first release. Both tiers work: the local library, and Realms
-(sign-in, listing, slot download and upload). See the
-[changelog](CHANGELOG.md) for what is in it, and its *Known limits* for what is
-not.
+**v0.2.0** — twelve issues found by using v0.1.0 in earnest. The vault no
+longer makes duplicate worlds or duplicate backups, Realm slots show the
+picture and the named add-ons of the world really on them, and a Realm left
+closed can be opened from the app. See the [changelog](CHANGELOG.md) for the
+full list, and its *Known limits* for what is not in it.
 
 | Milestone | State |
 |---|---|
@@ -84,6 +85,6 @@ Both Bedrock storage layouts are detected automatically:
 
 ## Disclaimer
 
-Not affiliated with Mojang or Microsoft. Realm integration (when it lands) will use an unofficial, community-documented API that may break at any time — use it with your own account and your own Realms only.
+Not affiliated with Mojang or Microsoft. Realm integration uses an unofficial, undocumented API that may break at any time — use it with your own account and your own Realms only.
 
 MIT licensed.
