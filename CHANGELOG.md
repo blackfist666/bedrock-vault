@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 — 2026-08-12
+
+Twelve issues found by using v0.1.0 in earnest. The vault stopped making
+duplicate worlds and duplicate backups, Realm slots learned to show what is
+really on them, and a Realm left closed can be opened from the app.
 
 - A Realm's three slots now spread across the whole window instead of being squashed into the left-hand half of a big screen. Their add-ons sit side by side rather than as one stretched bar each, and a slot's buttons stay under the world they act on (#12)
 - A Realm of your own that is closed now says so in amber and offers **Open** right beside it. The app can strand a Realm itself — replacing a world closes it, uploads, then reopens, so anything that interrupts that leaves it shut — and until now the only way back in was to open it from inside Minecraft, which is the trip the app exists to save (#9)
@@ -19,6 +23,13 @@
 - Backups are no longer taken of a world that has not changed since its last copy. Saving or backing up an untouched world stored another full archive every time — one world here held three identical 15 MB copies. **Back up** now says so instead of quietly making a duplicate (#6)
 - Realm slots now show a picture where there is a real one to show: the world's own `world_icon.jpeg` from a copy of it on this PC, matched by seed, or the artwork of the marketplace template it was built from. A slot with neither shows no picture rather than an invented one (#4)
 - Vault worlds now say where they last were: **MC**, **REALM**, **FILE** or **BACKUP**. The tag follows the world, so sending one up to a Realm makes it REALM and saving it out of the game makes it MC again. Worlds already in the vault stay untagged until they are next moved, since nothing recorded where they had been (#5)
+
+### Known limits
+
+- Downloading everything the account owns from the marketplace is not possible. Nothing on this PC lists it — the Xbox Store cache holds only the Realms subscription and the Minecoin purchases, and the real entitlement list is encrypted — the Xbox inventory service refuses this credential and does not carry marketplace content in any case, and the packs are themselves encrypted for the game to decrypt. It would mean writing a second client for Minecraft's store (#13)
+- Adding an add-on to a Realm is not possible: Realms mints its own ids for slot content, which appear nowhere locally and no endpoint resolves
+- A Realm slot shows a picture only where a real one exists — a copy of the world on this PC, or the artwork of the marketplace template it was built from. Realms itself provides none
+- Realms integration uses an unofficial API and may break without notice
 
 ## v0.1.0 — 2026-08-10
 
@@ -69,5 +80,5 @@ First release. A local world library for Minecraft Bedrock, with Realm support.
 
 - Adding an add-on to a Realm is not possible: Realms mints its own ids for slot content, which appear nowhere locally and no endpoint resolves
 - The Packs tab covers content installed on this PC; a full list of everything the account owns needs a marketplace API that refuses the credential available here
-- Realm slots have no artwork — Minecraft does not provide one
+- Realm slots have no artwork — Minecraft does not provide one *(lifted in v0.2.0)*
 - Realms integration uses an unofficial API and may break without notice
