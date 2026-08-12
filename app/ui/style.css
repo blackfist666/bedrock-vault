@@ -117,7 +117,12 @@ header {
 .hero-sub .mc-btn { padding: 4px 12px; font-size: 12px; border-bottom-width: 3px; }
 .hero-loading { color: var(--muted); font-size: 13px; }
 
-.slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+/* `auto-fit`, never `auto-fill`: a Realm has exactly three slots, and
+   `auto-fill` keeps making empty 280px tracks to fill a wide window, which left
+   the three cards squashed into the left half of a 4K screen with dead space
+   beside them. `auto-fit` collapses the empty tracks so the three share the
+   whole width, and still wraps to two or one when the window is narrow. */
+.slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
 
 .slot {
   background: var(--panel-solid);
@@ -147,7 +152,10 @@ header {
   background: #17181a;
 }
 .slot-rules { font-size: 11.5px; color: #7f8085; line-height: 1.6; }
-.slot-packs { display: flex; flex-direction: column; gap: 5px; }
+/* Add-ons sit side by side and wrap, so each one is only as wide as its name.
+   Stacked in a column they became a full-card-width bar with a short name at
+   the left end once the slots grew to fill the window. */
+.slot-packs { display: flex; flex-wrap: wrap; gap: 5px; }
 
 .pack-chip {
   display: flex;
@@ -437,7 +445,10 @@ footer { padding: 4px 20px 20px; color: var(--muted); font-size: 12px; }
 }
 
 .text-field:focus { outline: none; border-color: var(--green); }
-.slot .row-actions { margin-top: 4px; }
+/* A slot is a card read top to bottom, not a list row, so its buttons stay
+   under the world they act on. Right-aligned they ended up an arm's length from
+   the name once the slots filled a wide window. */
+.slot .row-actions { margin-top: 4px; justify-content: flex-start; }
 
 /* Must be last and more specific than any rule that sets `display`, otherwise
    an element like .progress or .modal stays on screen when hidden. */
